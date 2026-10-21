@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Lint {
     /// Tests in one file that differ in a few literals or identifiers: one table test.
@@ -52,9 +54,20 @@ pub fn print_report(hits: &[Hit], limit: usize) {
         hs.sort_by_key(|h| std::cmp::Reverse(h.saved_loc));
         let saved: usize = hs.iter().map(|h| h.saved_loc).sum();
         let name = serde_json::to_value(lint).expect("unit enum serializes");
-        println!("\n== {} : {} hits, ~{saved} LOC", name.as_str().unwrap_or_default(), hs.len());
+        println!(
+            "\n== {} : {} hits, ~{saved} LOC",
+            name.as_str().unwrap_or_default(),
+            hs.len()
+        );
         for h in hs.iter().take(limit) {
-            println!("  -{:<4} {}:{} {}  {}", h.saved_loc, h.file.display(), h.line, h.item, h.detail);
+            println!(
+                "  -{:<4} {}:{} {}  {}",
+                h.saved_loc,
+                h.file.display(),
+                h.line,
+                h.item,
+                h.detail
+            );
         }
     }
 }
@@ -74,7 +87,9 @@ impl Baseline {
 
     /// Overwrites `path` with a baseline that accepts exactly `hits`.
     pub fn write(path: &Path, hits: &[Hit]) -> Result<(), BaselineError> {
-        let b = Baseline { accepted: hits.iter().map(key).collect() };
+        let b = Baseline {
+            accepted: hits.iter().map(key).collect(),
+        };
         let s = serde_json::to_string_pretty(&b).map_err(BaselineError::Json)?;
         std::fs::write(path, s + "\n").map_err(BaselineError::Io)
     }
