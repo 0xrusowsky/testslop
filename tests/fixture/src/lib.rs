@@ -6,10 +6,24 @@ pub fn classify(x: i32) -> &'static str {
     if x < 0 { "neg" } else { "pos" }
 }
 
+#[derive(Debug)]
+pub enum ParseError {
+    NotANumber(String),
+}
+
+pub fn parse(s: &str) -> Result<u32, ParseError> {
+    s.parse().map_err(|_| ParseError::NotANumber(s.to_owned()))
+}
+
 pub struct Point {
     pub x: u32,
     pub y: u32,
     pub z: u32,
+}
+
+pub fn with_ctx<T>(f: impl FnOnce(&mut u32) -> T) -> T {
+    let mut ctx = 0;
+    f(&mut ctx)
 }
 
 #[cfg(test)]
@@ -28,6 +42,29 @@ mod tests {
         let input = 3;
         let out = double(input);
         assert_eq!(out, 6);
+    }
+
+    #[test]
+    fn double_two_again() {
+        let input = 2;
+        let out = double(input);
+        assert_eq!(out, 4);
+    }
+
+    #[test]
+    fn double_is_even() {
+        assert!(double(5) % 2 == 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn double_overflow_panics() {
+        double(u32::MAX);
+    }
+
+    #[test]
+    fn double_smoke() {
+        double(1);
     }
 
     #[test]
@@ -68,6 +105,40 @@ mod tests {
         check_double(7);
     }
 
+    fn halves_back(x: u32) {
+        assert_eq!(double(x) / 2, x);
+    }
+
+    #[test]
+    fn double_halves() {
+        halves_back(9);
+    }
+
+    #[test]
+    fn parse_rejects_words() {
+        let result = parse("seven");
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(ParseError::NotANumber(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_empty() {
+        let result = parse("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_rejects_sign() {
+        let input = "-";
+        let result = parse(input);
+        assert!(result.is_err());
+    }
+
+    // --- repeated blocks and shared setup ---
+
     #[test]
     fn double_repeated_block() {
         let a = double(1);
@@ -102,8 +173,9 @@ mod tests {
 
     #[test]
     fn total_is_even() {
+        // Build the points
         let points = vec![
-            Point { x: 1, y: 2, z: 3 },
+            Point { x: 2, y: 2, z: 3 },
         ];
         let total = points
             .iter()
@@ -117,7 +189,7 @@ mod tests {
     #[test]
     fn total_matches_classify() {
         let points = vec![
-            Point { x: 1, y: 2, z: 3 },
+            Point { x: 3, y: 2, z: 3 },
         ];
         let total = points
             .iter()
@@ -125,5 +197,50 @@ mod tests {
             .sum::<u32>();
         let label = classify(total as i32);
         assert_eq!(label, "pos", "total {total} of {} points", points.len());
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    #[test]
+    fn ctx_one() {
+        with_ctx(|ctx| {
+            *ctx += 1;
+            assert_eq!(*ctx, 1);
+        })
+    }
+
+    #[test]
+    fn ctx_double() {
+        with_ctx(|ctx| {
+            *ctx = double(4);
+            assert_eq!(*ctx, 8);
+        })
+    }
+
+    #[test]
+    fn ctx_classify() {
+        with_ctx(|ctx| {
+            *ctx = 3;
+            assert_eq!(classify(*ctx as i32), "pos");
+        })
+    }
+
+    #[test]
+    fn ctx_parse() {
+        with_ctx(|ctx| {
+            *ctx = parse("12").unwrap();
+            assert_eq!(*ctx, 12);
+        })
+    }
+
+    #[test]
+    fn ctx_point() {
+        with_ctx(|ctx| {
+            let p = Point { x: *ctx, y: 1, z: 2 };
+            assert_eq!(p.y + p.z, 3);
+        })
     }
 }

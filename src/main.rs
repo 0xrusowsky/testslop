@@ -138,14 +138,14 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
             if !out.json {
                 let ran = r.tests - r.failed.len();
+                let t = &r.triage;
                 println!(
-                    "== cov: {ran}/{} tests ran; {} production regions covered; greedy cover keeps {} tests ({} could go); {} tests are the only cover of some region; {} hits on macro-generated tests not reported",
-                    r.tests,
-                    r.regions_covered,
-                    r.min_cover,
-                    ran - r.min_cover,
-                    r.unique_contributors,
-                    r.macro_generated,
+                    "== cov: {ran}/{} tests ran; {} production regions covered; greedy cover keeps {} tests; {} tests are the only cover of some region",
+                    r.tests, r.regions_covered, r.min_cover, r.unique_contributors,
+                );
+                println!(
+                    "   not reported: {} covered by another test but asserting something it does not, {} #[should_panic], {} macro-generated",
+                    t.kept_distinct, t.should_panic, t.macro_generated,
                 );
             }
             emit(r.hits, &out)

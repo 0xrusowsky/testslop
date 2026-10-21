@@ -1,6 +1,5 @@
 //! Runs the binary on `tests/fixture`, a crate with one deliberate case per lint.
 
-use std::path::Path;
 use std::process::{Command, Output};
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixture");
@@ -40,24 +39,41 @@ fn scan_reports_each_static_lint_once() {
     assert_eq!(
         hits(&out),
         pairs(&[
-            ("parametrizable_tests", "double_two, double_three"),
+            (
+                "parametrizable_tests",
+                "double_two, double_three, double_two_again"
+            ),
             (
                 "missing_fixture",
-                "let points = vec ! [Point { x : 1 , y : 2 , z : 3 } ,] ; let total = points . iter () . map (| p | double (p . x)) . sum :: < u32 > () ;"
+                "let points = vec ! [Point { x : $ , y : $ , z : $ } ,] ; let total = points . iter () . map (| p | double (p . x)) . sum :: < u32 > () ;"
             ),
             ("copy_paste_assert_block", "double_repeated_block"),
-            ("no_assertion_test", "double_via_helper"),
+            ("no_assertion_test", "double_smoke"),
             ("tautological_assert", "double_is_deterministic"),
             ("field_by_field_assert", "point_fields"),
             ("manual_assert_matches", "classify_pos_matches"),
+            ("test_envelope", "with_ctx in ."),
+            ("verbose_err_assert", "parse_rejects_words"),
+            ("redundant_is_err_assert", "parse_rejects_words"),
+            ("narrator_comment", "total_is_even"),
+            ("divider_comment", "divider comments"),
         ])
     );
 }
 
+/// A fresh empty directory under the system temp dir, unique to this test process.
+fn tempdir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("testslop-{name}-{}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 #[test]
 fn baseline_accepts_written_hits_and_reports_stale_entries() {
-    let dir = std::env::temp_dir().join(format!("testslop-baseline-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = tempdir("baseline");
     let path = dir.join("baseline.json");
     let path_s = path.to_str().unwrap();
 
@@ -72,7 +88,7 @@ fn baseline_accepts_written_hits_and_reports_stale_entries() {
     ]);
     assert_eq!(
         hits(&written),
-        pairs(&[("no_assertion_test", "double_via_helper")])
+        pairs(&[("no_assertion_test", "double_smoke")])
     );
 
     let accepted = testslop(&[
@@ -109,9 +125,18 @@ fn baseline_accepts_written_hits_and_reports_stale_entries() {
 
 /// Needs the `llvm-tools` rustup component of the toolchain the fixture selects.
 #[test]
-fn cov_reports_empty_duplicate_and_subsumed_coverage() {
-    assert!(Path::new(FIXTURE).join("src/lib.rs").exists());
-    let out = testslop(&["cov", FIXTURE, "-p", "demo", "--jobs", "4", "--json"]);
+fn cov_triages_coverage_redundant_tests() {
+    let cwd = tempdir("cov-cwd");
+    let out = Command::new(env!("CARGO_BIN_EXE_testslop"))
+        .args(["cov", FIXTURE, "-p", "demo", "--jobs", "4", "--json"])
+        .current_dir(&cwd)
+        .output()
+        .expect("binary runs");
+    assert_eq!(
+        std::fs::read_dir(&cwd).unwrap().count(),
+        0,
+        "cov wrote files into the cwd"
+    );
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -122,15 +147,20 @@ fn cov_reports_empty_duplicate_and_subsumed_coverage() {
         hits(&out),
         pairs(&[
             ("no_prod_coverage", "tests::point_fields"),
-            ("duplicate_coverage", "tests::double_two"),
-            ("duplicate_coverage", "tests::double_three"),
-            ("duplicate_coverage", "tests::double_via_helper"),
-            ("duplicate_coverage", "tests::double_repeated_block"),
-            ("duplicate_coverage", "tests::total_is_positive"),
-            ("duplicate_coverage", "tests::total_is_even"),
-            ("subsumed_coverage", "tests::double_is_deterministic"),
+            ("duplicate_coverage", "tests::double_two_again"),
             ("subsumed_coverage", "tests::classify_neg"),
-            ("subsumed_coverage", "tests::classify_pos_matches"),
+            ("same_path_different_inputs", "tests::double_two"),
+            ("same_path_different_inputs", "tests::parse_rejects_sign"),
         ])
     );
+
+    let report = testslop(&["cov", FIXTURE, "-p", "demo", "--jobs", "4"]);
+    let stdout = String::from_utf8_lossy(&report.stdout);
+    assert_eq!(
+        stdout.lines().nth(1),
+        Some(
+            "   not reported: 13 covered by another test but asserting something it does not, 1 #[should_panic], 0 macro-generated"
+        ),
+    );
+    std::fs::remove_dir_all(&cwd).unwrap();
 }

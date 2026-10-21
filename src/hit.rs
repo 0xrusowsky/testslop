@@ -15,7 +15,7 @@ pub enum Lint {
     MissingFixture,
     /// A block of statements repeated inside one test: one loop or local closure.
     CopyPasteAssertBlock,
-    /// A test with no assertion, unwrap, `?` or panic of its own.
+    /// A test with no assertion, unwrap, `?`, panic, or call to an asserting helper.
     NoAssertionTest,
     /// `assert_eq!(x, x)` or `assert_ne!(x, x)`.
     TautologicalAssert,
@@ -25,10 +25,23 @@ pub enum Lint {
     ManualAssertMatches,
     /// A test that runs none of the production code under analysis.
     NoProdCoverage,
-    /// A test whose covered production regions equal another test's.
+    /// Covers the same production regions as another test, with the same inputs and only
+    /// assertions that test repeats: delete it.
     DuplicateCoverage,
-    /// A test whose covered production regions are a strict subset of another test's.
+    /// Like `DuplicateCoverage`, but the other test covers strictly more.
     SubsumedCoverage,
+    /// Runs no production code beyond another test, with other inputs: one table with it.
+    SamePathDifferentInputs,
+    /// Many tests in a crate wrap their body in the same closure-taking call: one test attribute or helper.
+    TestEnvelope,
+    /// A multi-line assertion on an error: one `assert_err!`-style helper line.
+    VerboseErrAssert,
+    /// `assert!(x.is_err())` right before a check of the error's variant.
+    RedundantIsErrAssert,
+    /// A one-line comment that restates the code below it.
+    NarratorComment,
+    /// A decorative divider comment in test code.
+    DividerComment,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
