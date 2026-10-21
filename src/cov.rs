@@ -45,19 +45,91 @@ pub struct Built {
     pub src_dir: PathBuf,
 }
 
-/// Builds `package`'s lib test binary under `<root>/target/testslop`, instrumenting only that crate.
+/// The target whose unit tests `cov` runs: the package's lib, or its only bin.
+enum UnitTarget {
+    Lib(String),
+    Bin(String),
+}
+
+impl UnitTarget {
+    /// Crate name rustc compiles the target under.
+    fn crate_name(&self) -> String {
+        let (Self::Lib(n) | Self::Bin(n)) = self;
+        n.replace('-', "_")
+    }
+}
+
+/// Reads `package`'s targets from `cargo metadata`.
+fn unit_target(root: &Path, package: &str) -> Result<UnitTarget, CovError> {
+    let out = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(root)
+        .output()
+        .map_err(|source| CovError::Spawn {
+            tool: "cargo metadata".into(),
+            source,
+        })?;
+    if !out.status.success() {
+        return Err(CovError::ToolFailed {
+            tool: "cargo metadata".into(),
+            status: out.status,
+            stderr: String::from_utf8_lossy(&out.stderr)
+                .chars()
+                .take(400)
+                .collect(),
+        });
+    }
+    let meta: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(CovError::Json)?;
+    let targets = meta["packages"]
+        .as_array()
+        .and_then(|ps| ps.iter().find(|p| p["name"] == package))
+        .and_then(|p| p["targets"].as_array())
+        .ok_or_else(|| CovError::NoUnitTarget {
+            package: package.into(),
+            bins: vec![],
+        })?;
+    let of_kind = |kind: &str| -> Vec<String> {
+        targets
+            .iter()
+            .filter(|t| {
+                t["kind"]
+                    .as_array()
+                    .is_some_and(|k| k.iter().any(|k| k == kind))
+            })
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect()
+    };
+    if let Some(lib) = of_kind("lib").into_iter().next() {
+        return Ok(UnitTarget::Lib(lib));
+    }
+    match <[String; 1]>::try_from(of_kind("bin")) {
+        Ok([bin]) => Ok(UnitTarget::Bin(bin)),
+        Err(bins) => Err(CovError::NoUnitTarget {
+            package: package.into(),
+            bins,
+        }),
+    }
+}
+
+/// Builds the unit-test binary of `package`'s lib (or only bin) under `<root>/target/testslop`,
+/// instrumenting only that crate.
 pub fn build(root: &Path, package: &str, cargo_args: &[String]) -> Result<Built, CovError> {
-    let krate = package.replace('-', "_");
+    let target = unit_target(root, package)?;
+    let krate = target.crate_name();
+    let target_args = match &target {
+        UnitTarget::Lib(_) => vec!["--lib".to_owned()],
+        UnitTarget::Bin(b) => vec!["--bin".to_owned(), b.clone()],
+    };
     let exe = std::env::current_exe().map_err(CovError::Io)?;
     let out = Command::new("cargo")
         .args([
             "test",
             "-p",
             package,
-            "--lib",
             "--no-run",
             "--message-format=json-render-diagnostics",
         ])
+        .args(&target_args)
         .args(cargo_args)
         .current_dir(root)
         .env("RUSTC_WORKSPACE_WRAPPER", exe)
@@ -193,8 +265,13 @@ pub enum CovError {
         stderr: String,
     },
     Timeout,
-    /// cargo built nothing that is the package's lib test binary.
+    /// cargo built nothing that is the package's unit-test binary.
     NoTestBinary,
+    /// The package has no lib and not exactly one bin (`bins` lists them).
+    NoUnitTarget {
+        package: String,
+        bins: Vec<String>,
+    },
     Json(serde_json::Error),
     Io(std::io::Error),
 }
@@ -209,7 +286,14 @@ impl std::fmt::Display for CovError {
                 stderr,
             } => write!(f, "{tool} exited with {status}: {stderr}"),
             Self::Timeout => write!(f, "test ran longer than {TEST_TIMEOUT:?}"),
-            Self::NoTestBinary => write!(f, "cargo reported no lib test binary for the package"),
+            Self::NoTestBinary => write!(f, "cargo reported no unit-test binary for the package"),
+            Self::NoUnitTarget { package, bins } => {
+                write!(
+                    f,
+                    "package `{package}` has no lib and {} bins {bins:?}; cov needs a lib or exactly one bin",
+                    bins.len()
+                )
+            }
             Self::Json(e) => write!(f, "llvm-cov json: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
         }

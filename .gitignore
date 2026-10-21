@@ -1,3 +1,7 @@
 /target
 /tests/fixture/target
 /tests/fixture/Cargo.lock
+/tests/fixture-bin/target
+/tests/fixture-bin/Cargo.lock
+/tests/fixture-bins/target
+/tests/fixture-bins/Cargo.lock

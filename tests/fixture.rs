@@ -164,3 +164,30 @@ fn cov_triages_coverage_redundant_tests() {
     );
     std::fs::remove_dir_all(&cwd).unwrap();
 }
+
+#[test]
+fn cov_runs_the_unit_tests_of_a_bin_only_package() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixture-bin");
+    let out = testslop(&["cov", dir, "-p", "demo-bin", "--jobs", "2", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        hits(&out),
+        pairs(&[("duplicate_coverage", "tests::triple_two_again")])
+    );
+}
+
+#[test]
+fn cov_rejects_a_package_with_several_bins_and_no_lib() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixture-bins");
+    let out = testslop(&["cov", dir, "-p", "demo-bins"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        r#"testslop: package `demo-bins` has no lib and 2 bins ["demo-bins", "extra"]; cov needs a lib or exactly one bin"#
+    );
+}
