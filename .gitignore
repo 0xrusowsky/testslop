@@ -5,3 +5,5 @@
 /tests/fixture-bin/Cargo.lock
 /tests/fixture-bins/target
 /tests/fixture-bins/Cargo.lock
+/tests/fixture-tooling/target
+/tests/fixture-tooling/Cargo.lock

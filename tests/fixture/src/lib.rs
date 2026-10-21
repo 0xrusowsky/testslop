@@ -21,6 +21,16 @@ pub struct Point {
     pub z: u32,
 }
 
+#[cfg(test)]
+impl Point {
+    fn origin() -> Self {
+        Point { x: 0, y: 0, z: 0 }
+    }
+}
+
+#[cfg(test)]
+pub mod test_util;
+
 pub fn with_ctx<T>(f: impl FnOnce(&mut u32) -> T) -> T {
     let mut ctx = 0;
     f(&mut ctx)
@@ -135,6 +145,53 @@ mod tests {
         let input = "-";
         let result = parse(input);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_ok() {
+        let input = "7";
+        assert!(parse(input).is_ok());
+        assert_eq!(parse(input).unwrap(), 7);
+    }
+
+    fn seven() -> &'static str {
+        "7"
+    }
+
+    #[test]
+    fn parse_ok_via_helper() {
+        let input = seven();
+        assert!(parse(input).is_ok());
+    }
+
+    const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/render.golden");
+
+    fn check_golden(actual: &str) {
+        if std::env::var("DEMO_UPDATE_GOLDEN").is_ok() {
+            std::fs::write(GOLDEN, actual).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(GOLDEN).unwrap().trim(), actual);
+    }
+
+    #[test]
+    fn render_matches_golden() {
+        check_golden(&double(21).to_string());
+    }
+
+    struct FakeStore {
+        value: u32,
+    }
+
+    impl FakeStore {
+        fn get(&self) -> u32 {
+            self.value
+        }
+    }
+
+    #[test]
+    fn fake_store_reads_origin() {
+        let p = Point::origin();
+        assert_eq!(FakeStore { value: p.x }.get(), 0);
     }
 
     // --- repeated blocks and shared setup ---

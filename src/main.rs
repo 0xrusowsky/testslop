@@ -3,6 +3,7 @@
 mod cov;
 mod hit;
 mod scan;
+mod suite;
 
 use clap::{Args, Parser, Subcommand};
 use hit::{Baseline, Hit, Lint};
@@ -23,7 +24,18 @@ enum Cmd {
         #[command(flatten)]
         out: Output,
     },
-    /// Builds a package's lib tests with coverage, runs each test alone, and compares the production code each covers.
+    /// What each crate's tests cost: test code, fixtures, test-only items, doubles, snapshots.
+    Crates {
+        root: PathBuf,
+        /// Print every crate as JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Crates shown in the table, most test code first.
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
+    /// Builds a package's unit tests (lib, or its only bin) with coverage, runs each test alone, and
+    /// compares the production code each covers.
     Cov {
         root: PathBuf,
         #[arg(short, long)]
@@ -38,6 +50,10 @@ enum Cmd {
         /// Tests run at once; defaults to the available parallelism.
         #[arg(long)]
         jobs: Option<usize>,
+        /// `PACKAGE:TEST`: also run this test target once, with the same crate instrumented, and report
+        /// unit tests whose production regions it already runs.
+        #[arg(long)]
+        against: Option<cov::Against>,
         #[command(flatten)]
         out: Output,
         /// Extra `cargo test` arguments, such as `--features test-utils`.
@@ -93,9 +109,18 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Scan { root, out } => {
             let s = scan::scan(&root);
             if !out.json {
-                print_sizes(&s);
+                print_crates(&s, 10);
             }
             emit(s.hits, &out)
+        }
+        Cmd::Crates { root, json, limit } => {
+            let s = scan::scan(&root);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&s.crates)?);
+            } else {
+                print_crates(&s, limit);
+            }
+            Ok(ExitCode::SUCCESS)
         }
         Cmd::Cov {
             root,
@@ -103,11 +128,16 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             prod_dirs,
             llvm_bin,
             jobs,
+            against,
             out,
             cargo_args,
         } => {
             let root = root.canonicalize()?;
             let built = cov::build(&root, &package, &cargo_args)?;
+            let against_bin = match &against {
+                Some(a) => Some(cov::build_against(&root, a, &built.krate, &cargo_args)?),
+                None => None,
+            };
             let prod_dirs = if prod_dirs.is_empty() {
                 vec![built.src_dir]
             } else {
@@ -125,6 +155,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             let cfg = cov::CovConfig {
                 root: &root,
                 bin: &built.bin,
+                against: against.as_ref().zip(against_bin.as_deref()),
                 prod_dirs: &prod_dirs,
                 llvm_bin: &llvm_bin,
                 jobs,
@@ -182,7 +213,8 @@ fn emit(mut hits: Vec<Hit>, out: &Output) -> Result<ExitCode, Box<dyn std::error
     })
 }
 
-fn print_sizes(s: &scan::Scan) {
+/// Totals, then the `limit` crates with the most test code (`.rs` plus fixtures).
+fn print_crates(s: &scan::Scan, limit: usize) {
     let (prod, test, n) = s.crates.values().fold((0, 0, 0), |a, c| {
         (a.0 + c.prod_loc, a.1 + c.test_loc, a.2 + c.tests)
     });
@@ -190,15 +222,31 @@ fn print_sizes(s: &scan::Scan) {
         "== {n} tests, test LOC {test}, prod LOC {prod} ({:.2}x)",
         test as f64 / prod.max(1) as f64
     );
-    let mut crates: Vec<_> = s.crates.iter().filter(|(_, c)| c.test_loc > 0).collect();
-    crates.sort_by_key(|(_, c)| std::cmp::Reverse(c.test_loc));
-    for (dir, c) in crates.iter().take(10) {
-        let ratio = c.test_loc as f64 / c.prod_loc.max(1) as f64;
+    let mut crates: Vec<_> = s
+        .crates
+        .iter()
+        .filter(|(_, c)| c.tests > 0 || c.test_loc > 0)
+        .collect();
+    crates.sort_by_key(|(_, c)| std::cmp::Reverse(c.test_loc + c.fixture_loc));
+    println!(
+        "  {:>7} {:>7} {:>7} {:>7} {:>6} {:>6} {:>9} {:>6}  crate",
+        "test", "fixture", "cfgtest", "prod", "ratio", "tests", "doubles", "golden"
+    );
+    for (dir, c) in crates.iter().take(limit) {
+        let ratio = match c.prod_loc {
+            0 => "-".to_owned(),
+            p => format!("{:.2}x", (c.test_loc + c.fixture_loc) as f64 / p as f64),
+        };
         println!(
-            "  {:>6} test {:>6} prod {ratio:>5.2}x {:>5} tests  {}",
+            "  {:>7} {:>7} {:>7} {:>7} {ratio:>6} {:>6} {:>4}/{:<4} {:>6}  {}",
             c.test_loc,
+            c.fixture_loc,
+            c.test_only_items_loc,
             c.prod_loc,
             c.tests,
+            c.doubles,
+            c.doubles_loc,
+            c.goldens,
             Path::new(dir).display()
         );
     }

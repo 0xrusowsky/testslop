@@ -13,16 +13,20 @@ use std::time::{Duration, Instant};
 
 /// How long one test may run before it is killed and reported as failed.
 const TEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long the whole `--against` suite may run.
+const SUITE_TIMEOUT: Duration = Duration::from_secs(3600);
 /// llvm-cov region kind of plain code (not expansion, skipped, gap or branch).
 const CODE_REGION: u64 = 0;
 
-/// Env var that switches the binary into rustc-wrapper mode, naming the one crate to instrument.
+/// Env var that switches the binary into rustc-wrapper mode, naming the crates to instrument
+/// (comma-separated).
 pub const INSTRUMENT_CRATE_ENV: &str = "TESTSLOP_INSTRUMENT_CRATE";
 
 /// Runs as `RUSTC_WORKSPACE_WRAPPER`: `args` is `rustc` and its arguments; adds
-/// `-C instrument-coverage` only when compiling `krate`, so llvm-cov loads one crate's mapping.
+/// `-C instrument-coverage` only when compiling one of `krates` (comma-separated), so llvm-cov
+/// loads only their mappings.
 pub fn wrap_rustc(
-    krate: &str,
+    krates: &str,
     args: &[std::ffi::OsString],
 ) -> Result<std::process::ExitStatus, std::io::Error> {
     let (rustc, rest) = args
@@ -32,7 +36,7 @@ pub fn wrap_rustc(
     cmd.args(rest);
     if rest
         .windows(2)
-        .any(|w| w[0] == "--crate-name" && w[1] == krate)
+        .any(|w| w[0] == "--crate-name" && krates.split(',').any(|k| w[1] == k))
     {
         cmd.args(["-C", "instrument-coverage"]);
     }
@@ -41,6 +45,8 @@ pub fn wrap_rustc(
 
 pub struct Built {
     pub bin: PathBuf,
+    /// The instrumented crate's rustc name.
+    pub krate: String,
     /// The lib target's source directory, relative to the root.
     pub src_dir: PathBuf,
 }
@@ -111,8 +117,8 @@ fn unit_target(root: &Path, package: &str) -> Result<UnitTarget, CovError> {
     }
 }
 
-/// Builds the unit-test binary of `package`'s lib (or only bin) under `<root>/target/testslop`,
-/// instrumenting only that crate.
+/// Builds the unit-test binary of `package`'s lib (or only bin) under
+/// `<root>/target/testslop/<crate>`, instrumenting only that crate.
 pub fn build(root: &Path, package: &str, cargo_args: &[String]) -> Result<Built, CovError> {
     let target = unit_target(root, package)?;
     let krate = target.crate_name();
@@ -120,6 +126,79 @@ pub fn build(root: &Path, package: &str, cargo_args: &[String]) -> Result<Built,
         UnitTarget::Lib(_) => vec!["--lib".to_owned()],
         UnitTarget::Bin(b) => vec!["--bin".to_owned(), b.clone()],
     };
+    let (bin, src_path) =
+        cargo_test_build(root, package, &target_args, &krate, &krate, cargo_args)?;
+    let src_dir = src_path
+        .parent()
+        .and_then(|p| p.strip_prefix(root).ok())
+        .ok_or(CovError::NoTestBinary)?;
+    Ok(Built {
+        bin,
+        krate,
+        src_dir: src_dir.to_path_buf(),
+    })
+}
+
+/// Another package's test target whose combined coverage `cov --against` compares unit tests with.
+#[derive(Clone, Debug)]
+pub struct Against {
+    pub package: String,
+    pub test: String,
+}
+
+impl std::str::FromStr for Against {
+    type Err = String;
+    /// `PACKAGE:TEST`, where TEST is a `cargo test --test` target.
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.split_once(':') {
+            Some((p, t)) if !p.is_empty() && !t.is_empty() => Ok(Self {
+                package: p.into(),
+                test: t.into(),
+            }),
+            _ => Err(format!("expected PACKAGE:TEST, got `{s}`")),
+        }
+    }
+}
+
+impl std::fmt::Display for Against {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.package, self.test)
+    }
+}
+
+/// Builds the `--against` test target with the same crate (`krate`) instrumented. The test crate
+/// is instrumented too, so the profiler runtime gets linked; its regions are test code.
+pub fn build_against(
+    root: &Path,
+    against: &Against,
+    krate: &str,
+    cargo_args: &[String],
+) -> Result<PathBuf, CovError> {
+    let args = ["--test".to_owned(), against.test.clone()];
+    let test_crate = against.test.replace('-', "_");
+    let instrument = format!("{krate},{test_crate}");
+    Ok(cargo_test_build(
+        root,
+        &against.package,
+        &args,
+        &instrument,
+        &test_crate,
+        cargo_args,
+    )?
+    .0)
+}
+
+/// Runs `cargo test --no-run` for `target_args` with only the `krate` crates (comma-separated)
+/// instrumented, and returns the test
+/// executable of the target named `target_name` (dashes normalized) with that target's `src_path`.
+fn cargo_test_build(
+    root: &Path,
+    package: &str,
+    target_args: &[String],
+    krate: &str,
+    target_name: &str,
+    cargo_args: &[String],
+) -> Result<(PathBuf, PathBuf), CovError> {
     let exe = std::env::current_exe().map_err(CovError::Io)?;
     let out = Command::new("cargo")
         .args([
@@ -129,12 +208,16 @@ pub fn build(root: &Path, package: &str, cargo_args: &[String]) -> Result<Built,
             "--no-run",
             "--message-format=json-render-diagnostics",
         ])
-        .args(&target_args)
+        .args(target_args)
         .args(cargo_args)
         .current_dir(root)
         .env("RUSTC_WORKSPACE_WRAPPER", exe)
-        .env(INSTRUMENT_CRATE_ENV, &krate)
-        .env("CARGO_TARGET_DIR", root.join("target/testslop"))
+        .env(INSTRUMENT_CRATE_ENV, krate)
+        // cargo does not track the wrapper's env, so each instrumented set gets its own target dir.
+        .env(
+            "CARGO_TARGET_DIR",
+            root.join("target/testslop").join(krate.replace(',', "+")),
+        )
         .stderr(Stdio::inherit())
         .output()
         .map_err(|source| CovError::Spawn {
@@ -157,13 +240,9 @@ pub fn build(root: &Path, package: &str, cargo_args: &[String]) -> Result<Built,
                 && m["profile"]["test"] == true
                 && target["name"]
                     .as_str()
-                    .is_some_and(|n| n.replace('-', "_") == krate);
+                    .is_some_and(|n| n.replace('-', "_") == target_name);
             let bin = PathBuf::from(m["executable"].as_str().filter(|_| is_ours)?);
-            let src = Path::new(target["src_path"].as_str()?).parent()?;
-            Some(Built {
-                bin,
-                src_dir: src.strip_prefix(root).ok()?.to_path_buf(),
-            })
+            Some((bin, PathBuf::from(target["src_path"].as_str()?)))
         })
         .ok_or(CovError::NoTestBinary)
 }
@@ -171,6 +250,8 @@ pub fn build(root: &Path, package: &str, cargo_args: &[String]) -> Result<Built,
 pub struct CovConfig<'a> {
     pub root: &'a Path,
     pub bin: &'a Path,
+    /// The `--against` suite and its built test executable.
+    pub against: Option<(&'a Against, &'a Path)>,
     /// Directories relative to `root` whose non-test code counts as production code.
     pub prod_dirs: &'a [PathBuf],
     pub llvm_bin: &'a Path,
@@ -264,7 +345,7 @@ pub enum CovError {
         status: std::process::ExitStatus,
         stderr: String,
     },
-    Timeout,
+    Timeout(Duration),
     /// cargo built nothing that is the package's unit-test binary.
     NoTestBinary,
     /// The package has no lib and not exactly one bin (`bins` lists them).
@@ -285,7 +366,7 @@ impl std::fmt::Display for CovError {
                 status,
                 stderr,
             } => write!(f, "{tool} exited with {status}: {stderr}"),
-            Self::Timeout => write!(f, "test ran longer than {TEST_TIMEOUT:?}"),
+            Self::Timeout(t) => write!(f, "ran longer than {t:?}"),
             Self::NoTestBinary => write!(f, "cargo reported no unit-test binary for the package"),
             Self::NoUnitTarget { package, bins } => {
                 write!(
@@ -348,64 +429,65 @@ fn list_tests(bin: &Path, work_dir: &Path) -> Result<Vec<String>, CovError> {
     Ok(tests)
 }
 
-/// Runs one test alone and returns the production regions it executed.
-fn cover_one(
-    cfg: &CovConfig,
-    scan: &Scan,
-    idx: usize,
-    test: &str,
-) -> Result<HashSet<Region>, CovError> {
-    let raw = cfg.work_dir.join(format!("{idx}.profraw"));
-    let data = cfg.work_dir.join(format!("{idx}.profdata"));
-    let mut child = Command::new(cfg.bin)
-        .args(["--exact", test, "--test-threads=1", "-q"])
-        .env("LLVM_PROFILE_FILE", &raw)
+/// Runs `cmd` to completion, killing it after `timeout`.
+fn run_bounded(
+    cmd: &mut Command,
+    timeout: Duration,
+    tool: &str,
+) -> Result<std::process::ExitStatus, CovError> {
+    let mut child = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|source| CovError::Spawn {
-            tool: cfg.bin.display().to_string(),
+            tool: tool.into(),
             source,
         })?;
-    let deadline = Instant::now() + TEST_TIMEOUT;
-    let status = loop {
+    let deadline = Instant::now() + timeout;
+    loop {
         if let Some(s) = child.try_wait().map_err(CovError::Io)? {
-            break s;
+            return Ok(s);
         }
         if Instant::now() > deadline {
             child.kill().map_err(CovError::Io)?;
             child.wait().map_err(CovError::Io)?;
-            return Err(CovError::Timeout);
+            return Err(CovError::Timeout(timeout));
         }
         std::thread::sleep(Duration::from_millis(20));
-    };
-    if !status.success() {
-        let _ = std::fs::remove_file(&raw);
-        return Err(CovError::ToolFailed {
-            tool: test.into(),
-            status,
-            stderr: String::new(),
-        });
     }
+}
 
+/// Merges raw profiles into `out` and deletes them.
+fn merge(cfg: &CovConfig, raws: &[PathBuf], out: &Path) -> Result<(), CovError> {
     let profdata = cfg.llvm_bin.join("llvm-profdata");
     run(
         &profdata,
         Command::new(&profdata)
             .arg("merge")
             .arg("-sparse")
-            .arg(&raw)
+            .args(raws)
             .arg("-o")
-            .arg(&data),
+            .arg(out),
     )?;
-    std::fs::remove_file(&raw).map_err(CovError::Io)?;
+    for r in raws {
+        std::fs::remove_file(r).map_err(CovError::Io)?;
+    }
+    Ok(())
+}
 
+/// Production regions `profdata` counts as executed in `object`; deletes `profdata`.
+fn export_regions(
+    cfg: &CovConfig,
+    scan: &Scan,
+    profdata: &Path,
+    object: &Path,
+) -> Result<HashSet<Region>, CovError> {
     let llvm_cov = cfg.llvm_bin.join("llvm-cov");
     let mut export = Command::new(&llvm_cov)
         .args(["export", "-format=text", "-skip-expansions"])
-        .arg(format!("-instr-profile={}", data.display()))
+        .arg(format!("-instr-profile={}", profdata.display()))
         .arg("-object")
-        .arg(cfg.bin)
+        .arg(object)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -441,7 +523,7 @@ fn cover_one(
     let mut de = serde_json::Deserializer::from_reader(BufReader::with_capacity(1 << 20, stdout));
     let parsed = ExportSeed::Root(&mut sink).deserialize(&mut de);
     let status = export.wait().map_err(CovError::Io)?;
-    std::fs::remove_file(&data).map_err(CovError::Io)?;
+    std::fs::remove_file(profdata).map_err(CovError::Io)?;
     if !status.success() {
         return Err(CovError::ToolFailed {
             tool: llvm_cov.display().to_string(),
@@ -451,6 +533,71 @@ fn cover_one(
     }
     parsed.map_err(CovError::Json)?;
     Ok(covered)
+}
+
+/// Runs one test alone and returns the production regions it executed.
+fn cover_one(
+    cfg: &CovConfig,
+    scan: &Scan,
+    idx: usize,
+    test: &str,
+) -> Result<HashSet<Region>, CovError> {
+    let raw = cfg.work_dir.join(format!("{idx}.profraw"));
+    let data = cfg.work_dir.join(format!("{idx}.profdata"));
+    let status = run_bounded(
+        Command::new(cfg.bin)
+            .args(["--exact", test, "--test-threads=1", "-q"])
+            .env("LLVM_PROFILE_FILE", &raw),
+        TEST_TIMEOUT,
+        &cfg.bin.display().to_string(),
+    )?;
+    if !status.success() {
+        if raw.exists() {
+            std::fs::remove_file(&raw).map_err(CovError::Io)?;
+        }
+        return Err(CovError::ToolFailed {
+            tool: test.into(),
+            status,
+            stderr: String::new(),
+        });
+    }
+    merge(cfg, std::slice::from_ref(&raw), &data)?;
+    export_regions(cfg, scan, &data, cfg.bin)
+}
+
+/// Runs the whole `--against` suite once and returns the production regions it executed.
+fn cover_suite(
+    cfg: &CovConfig,
+    scan: &Scan,
+    against: &Against,
+    bin: &Path,
+) -> Result<HashSet<Region>, CovError> {
+    let status = run_bounded(
+        Command::new(bin).env(
+            "LLVM_PROFILE_FILE",
+            cfg.work_dir.join("against-%p-%m.profraw"),
+        ),
+        SUITE_TIMEOUT,
+        &against.to_string(),
+    )?;
+    if !status.success() {
+        return Err(CovError::ToolFailed {
+            tool: against.to_string(),
+            status,
+            stderr: String::new(),
+        });
+    }
+    let raws: Vec<PathBuf> = std::fs::read_dir(cfg.work_dir)
+        .map_err(CovError::Io)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("against-"))
+        })
+        .collect();
+    let data = cfg.work_dir.join("against.profdata");
+    merge(cfg, &raws, &data)?;
+    export_regions(cfg, scan, &data, bin)
 }
 
 /// Delete sorts before Table, so the strongest verdict wins.
@@ -640,6 +787,55 @@ pub fn analyze(cfg: &CovConfig, scan: &Scan) -> Result<CovReport, CovError> {
                 },
             ),
         });
+    }
+
+    // Helpers and doubles that only deletion candidates use go with them; ones nothing uses at
+    // all are `scan` hits already.
+    let deleted: Vec<&crate::scan::TestFn> = hits
+        .iter()
+        .filter(|h| matches!(h.lint, Lint::DuplicateCoverage | Lint::SubsumedCoverage))
+        .filter_map(|h| by_harness.get(h.item.as_str()).copied())
+        .collect();
+    if !deleted.is_empty() {
+        let unused: HashSet<String> = crate::suite::orphan_hits(scan, &[])
+            .into_iter()
+            .map(|h| h.item)
+            .collect();
+        hits.extend(
+            crate::suite::orphan_hits(scan, &deleted)
+                .into_iter()
+                .filter(|h| !unused.contains(&h.item)),
+        );
+    }
+
+    if let Some((against, bin)) = cfg.against {
+        let suite = cover_suite(cfg, scan, against, bin)?;
+        let mut regions: Vec<Option<&Region>> = vec![None; ids.len()];
+        for (r, &id) in &ids {
+            regions[id] = Some(r);
+        }
+        let reported: HashSet<&str> = hits.iter().map(|h| h.item.as_str()).collect();
+        let mut covered_hits = vec![];
+        for (idx, v) in &sets {
+            let name = tests[*idx].as_str();
+            let Some(t) = by_harness.get(name) else {
+                continue;
+            };
+            let in_suite = !v.is_empty()
+                && v.iter()
+                    .all(|&r| regions[r].is_some_and(|r| suite.contains(r)));
+            if in_suite && !t.should_panic && !reported.contains(name) {
+                covered_hits.push(Hit {
+                    lint: Lint::CoveredBySuite,
+                    file: t.file.clone(),
+                    line: t.line,
+                    item: name.to_owned(),
+                    saved_loc: t.loc,
+                    detail: format!("all {} of its regions also run in {against}; keep it only if it asserts what that suite does not", v.len()),
+                });
+            }
+        }
+        hits.extend(covered_hits);
     }
 
     let mut cover_count = vec![0u32; ids.len()];

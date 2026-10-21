@@ -57,6 +57,10 @@ fn scan_reports_each_static_lint_once() {
             ("redundant_is_err_assert", "parse_rejects_words"),
             ("narrator_comment", "total_is_even"),
             ("divider_comment", "divider comments"),
+            ("meta_tests", "src/test_util.rs"),
+            ("characterization_golden", "render_matches_golden"),
+            ("duplicate_test_double", "FakeStore"),
+            ("orphaned_test_helper", "unused_helper"),
         ])
     );
 }
@@ -147,10 +151,14 @@ fn cov_triages_coverage_redundant_tests() {
         hits(&out),
         pairs(&[
             ("no_prod_coverage", "tests::point_fields"),
+            ("no_prod_coverage", "tests::fake_store_reads_origin"),
+            ("no_prod_coverage", "test_util::tests::sample_is_21"),
             ("duplicate_coverage", "tests::double_two_again"),
+            ("duplicate_coverage", "tests::parse_ok_via_helper"),
             ("subsumed_coverage", "tests::classify_neg"),
             ("same_path_different_inputs", "tests::double_two"),
             ("same_path_different_inputs", "tests::parse_rejects_sign"),
+            ("orphaned_test_helper", "seven"),
         ])
     );
 
@@ -159,7 +167,7 @@ fn cov_triages_coverage_redundant_tests() {
     assert_eq!(
         stdout.lines().nth(1),
         Some(
-            "   not reported: 13 covered by another test but asserting something it does not, 1 #[should_panic], 0 macro-generated"
+            "   not reported: 15 covered by another test but asserting something it does not, 1 #[should_panic], 0 macro-generated"
         ),
     );
     std::fs::remove_dir_all(&cwd).unwrap();
@@ -168,7 +176,7 @@ fn cov_triages_coverage_redundant_tests() {
 #[test]
 fn cov_runs_the_unit_tests_of_a_bin_only_package() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixture-bin");
-    let out = testslop(&["cov", dir, "-p", "demo-bin", "--jobs", "2", "--json"]);
+    let out = testslop(&["cov", dir, "-p", "demo-harness", "--jobs", "2", "--json"]);
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -190,4 +198,75 @@ fn cov_rejects_a_package_with_several_bins_and_no_lib() {
         String::from_utf8_lossy(&out.stderr).trim(),
         r#"testslop: package `demo-bins` has no lib and 2 bins ["demo-bins", "extra"]; cov needs a lib or exactly one bin"#
     );
+}
+
+#[test]
+fn cov_against_reports_unit_tests_the_suite_already_runs() {
+    let out = testslop(&[
+        "cov",
+        FIXTURE,
+        "-p",
+        "demo",
+        "--jobs",
+        "4",
+        "--against",
+        "demo:it",
+        "--only",
+        "covered-by-suite",
+        "--json",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let covered: Vec<(String, String)> = [
+        "double_three",
+        "double_is_even",
+        "double_smoke",
+        "double_is_deterministic",
+        "double_via_helper",
+        "double_halves",
+        "render_matches_golden",
+        "double_repeated_block",
+        "total_is_positive",
+        "total_is_even",
+    ]
+    .iter()
+    .map(|t| ("covered_by_suite".to_owned(), format!("tests::{t}")))
+    .collect();
+    assert_eq!(hits(&out), covered);
+}
+
+#[test]
+fn crates_reports_fixtures_test_only_items_doubles_and_goldens() {
+    let out = testslop(&["crates", FIXTURE, "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let c = &v["."];
+    assert_eq!(c["package"], "demo");
+    assert_eq!(c["fixture_loc"], 1, "testdata/render.golden");
+    assert_eq!(
+        c["test_only_items_loc"], 6,
+        "the #[cfg(test)] impl of Point"
+    );
+    assert_eq!(c["unit_tests"], 30);
+    assert_eq!(c["tests"], 31);
+    assert_eq!(c["goldens"], 1);
+    assert_eq!(c["doubles"], 2);
+}
+
+#[test]
+fn scan_reports_unit_tests_of_a_tooling_crate() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixture-bin");
+    let out = testslop(&["scan", dir, "--only", "meta-tests", "--json"]);
+    assert_eq!(hits(&out), pairs(&[("meta_tests", ".")]));
+}
+
+#[test]
+fn meta_tests_skip_tooling_named_crates_other_crates_build_on() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixture-tooling");
+    let out = testslop(&["scan", dir, "--only", "meta-tests", "--json"]);
+    assert_eq!(hits(&out), pairs(&[("meta_tests", "app-harness")]));
 }

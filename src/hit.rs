@@ -42,6 +42,20 @@ pub enum Lint {
     NarratorComment,
     /// A decorative divider comment in test code.
     DividerComment,
+    /// Unit tests of test infrastructure (a harness, simulation or test-utils crate, or a
+    /// `test_util` module): verify the tooling by running it.
+    MetaTests,
+    /// A test that compares output against a checked-in snapshot it can regenerate: it detects
+    /// change, not wrong behavior.
+    CharacterizationGolden,
+    /// The same test double (`FakeChain`, `MockStore`, ..) defined in several files of a crate.
+    DuplicateTestDouble,
+    /// A file whose test code is largely hand-written fakes: the tests check against a model.
+    FakeHeavyTests,
+    /// A test helper or double nothing references, or that only deletion candidates use.
+    OrphanedTestHelper,
+    /// A unit test whose production regions another suite (`cov --against`) already runs.
+    CoveredBySuite,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

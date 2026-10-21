@@ -16,6 +16,8 @@ const MIN_ENVELOPE_TESTS: usize = 5;
 pub struct TestFn {
     /// Path relative to the scanned root.
     pub file: PathBuf,
+    /// Directory of the crate (nearest `Cargo.toml`) relative to the root; `.` for the root.
+    pub krate: String,
     /// `module::path::name` as the libtest harness lists it, for tests under `src/`.
     pub harness_name: Option<String>,
     pub name: String,
@@ -61,6 +63,39 @@ impl TestFn {
     pub fn inputs_repeated_in(&self, other: &TestFn) -> bool {
         self.inputs.is_subset(&other.inputs)
     }
+
+    /// Occurrences of `ident` in the body.
+    pub fn uses(&self, ident: &str) -> usize {
+        self.exact.iter().filter(|t| *t == ident).count()
+    }
+}
+
+/// What a piece of test support code is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SupportKind {
+    /// A non-test function in test code.
+    Helper,
+    /// A `Fake*`/`Mock*`/`Stub*`/`Dummy*`/`Spy*`/`Noop*` type in test code, with its impl blocks.
+    Double,
+}
+
+/// A test helper or test double.
+pub struct Support {
+    pub kind: SupportKind,
+    pub name: String,
+    pub file: PathBuf,
+    pub krate: String,
+    pub line: usize,
+    pub loc: usize,
+    /// Identifier occurrences inside the definition (and, for doubles, their impl blocks).
+    idents: HashMap<String, usize>,
+}
+
+impl Support {
+    /// Occurrences of `ident` inside this item.
+    pub fn uses(&self, ident: &str) -> usize {
+        self.idents.get(ident).copied().unwrap_or(0)
+    }
 }
 
 /// Lines of one file that are test code.
@@ -78,20 +113,51 @@ impl TestCode {
     }
 }
 
-#[derive(Default)]
+/// One crate's production and test code, for the `crates` report.
+#[derive(Default, serde::Serialize)]
 pub struct CrateSize {
+    /// `[package] name` from the crate's `Cargo.toml`.
+    pub package: Option<String>,
     pub prod_loc: usize,
+    /// `.rs` test code: test files, `#[cfg(test)]` modules and items, test functions.
     pub test_loc: usize,
+    /// Non-`.rs` files tests read: `testdata/`, `fixtures/`, `snapshots/`, files under `tests/`,
+    /// and `include_str!`/`include_bytes!` targets in test code.
+    pub fixture_loc: usize,
+    /// `#[cfg(test)]` items (helpers, impls, types) inside production files.
+    pub test_only_items_loc: usize,
     pub tests: usize,
+    /// Tests under the crate's `src/`: unit tests, as opposed to `tests/` integration tests.
+    pub unit_tests: usize,
+    /// Tests that compare against a snapshot (`characterization_golden`).
+    pub goldens: usize,
+    pub doubles: usize,
+    pub doubles_loc: usize,
+    /// Workspace crates that list this one under normal or build dependencies (not dev).
+    pub used_by: usize,
 }
 
 pub struct Scan {
     pub tests: Vec<TestFn>,
+    pub support: Vec<Support>,
     pub hits: Vec<Hit>,
-    /// Keyed by the crate directory relative to the root.
+    /// Keyed by the crate directory relative to the root (`.` for the root).
     pub crates: BTreeMap<String, CrateSize>,
     /// Keyed by path relative to the root.
     pub test_code: HashMap<PathBuf, TestCode>,
+    /// Test lines per file, keyed by path relative to the root.
+    pub file_test_loc: HashMap<PathBuf, usize>,
+    pub index: Index,
+}
+
+/// Workspace-wide facts the per-file pass needs.
+pub struct Index {
+    /// Non-test functions in test code whose bodies assert: calls to them are assertions.
+    asserting: HashSet<String>,
+    /// Non-test functions in test code that compare against or rewrite a snapshot, with the marker.
+    golden: HashMap<String, String>,
+    /// Occurrences of each identifier across every token of every file, definitions included.
+    pub ident_counts: HashMap<String, usize>,
 }
 
 /// A test whose tail expression is `callee(args.., |..| { body })`.
@@ -143,20 +209,26 @@ fn is_test_file(rel: &Path, ast: &syn::File) -> bool {
     }) || is_cfg_test(&ast.attrs)
 }
 
-/// Names of non-test functions in test code whose bodies assert: calls to them are assertions.
-fn asserting_helpers(root: &Path) -> HashSet<String> {
-    struct Helpers {
+/// Builds the `Index` in a first pass over every file.
+fn index(root: &Path) -> Index {
+    struct Pass {
         in_test: bool,
-        names: HashSet<String>,
+        idx: Index,
     }
-    impl Helpers {
+    impl Pass {
         fn check(&mut self, attrs: &[syn::Attribute], ident: &syn::Ident, body: &syn::Block) {
-            if self.in_test && !attrs.iter().any(is_test_attr) && asserts_anything(body) {
-                self.names.insert(ident.to_string());
+            if !self.in_test || attrs.iter().any(is_test_attr) {
+                return;
+            }
+            if asserts_anything(body) {
+                self.idx.asserting.insert(ident.to_string());
+            }
+            if let Some(m) = golden_marker(body, &HashMap::new()) {
+                self.idx.golden.insert(ident.to_string(), m);
             }
         }
     }
-    impl<'a> Visit<'a> for Helpers {
+    impl<'a> Visit<'a> for Pass {
         fn visit_item_mod(&mut self, m: &'a syn::ItemMod) {
             let was = self.in_test;
             self.in_test |= is_cfg_test(&m.attrs);
@@ -164,23 +236,141 @@ fn asserting_helpers(root: &Path) -> HashSet<String> {
             self.in_test = was;
         }
         fn visit_item_fn(&mut self, f: &'a syn::ItemFn) {
+            let was = self.in_test;
+            self.in_test |= is_cfg_test(&f.attrs);
             self.check(&f.attrs, &f.sig.ident, &f.block);
             syn::visit::visit_item_fn(self, f);
+            self.in_test = was;
         }
         fn visit_impl_item_fn(&mut self, f: &'a syn::ImplItemFn) {
             self.check(&f.attrs, &f.sig.ident, &f.block);
             syn::visit::visit_impl_item_fn(self, f);
         }
     }
-    let mut h = Helpers {
+    fn count_idents(ts: TokenStream, counts: &mut HashMap<String, usize>) {
+        for tt in ts {
+            match tt {
+                TokenTree::Ident(i) => *counts.entry(i.to_string()).or_default() += 1,
+                TokenTree::Group(g) => count_idents(g.stream(), counts),
+                _ => {}
+            }
+        }
+    }
+    let mut p = Pass {
         in_test: false,
-        names: HashSet::new(),
+        idx: Index {
+            asserting: HashSet::new(),
+            golden: HashMap::new(),
+            ident_counts: HashMap::new(),
+        },
     };
     for (rel, _, ast) in rust_files(root) {
-        h.in_test = is_test_file(&rel, &ast);
-        h.visit_file(&ast);
+        p.in_test = is_test_file(&rel, &ast);
+        p.visit_file(&ast);
+        count_idents(ast.to_token_stream(), &mut p.idx.ident_counts);
     }
-    h.names
+    p.idx
+}
+
+/// insta and expect-test macros that compare against a stored snapshot.
+const SNAPSHOT_MACROS: &[&str] = &[
+    "assert_snapshot",
+    "assert_debug_snapshot",
+    "assert_json_snapshot",
+    "assert_yaml_snapshot",
+    "assert_toml_snapshot",
+    "assert_ron_snapshot",
+    "assert_csv_snapshot",
+    "assert_compact_debug_snapshot",
+    "assert_compact_json_snapshot",
+    "expect_file",
+];
+
+/// A string literal that regenerates goldens (`UPDATE_GOLDEN`-style env var) or names a snapshot file.
+fn golden_literal(v: &str) -> Option<String> {
+    // `INSTA_UPDATE`, `TEMPO_DST_UPDATE_GOLDEN`, `BLESS`; a bare word like `"UPDATE"` may be SQL.
+    let env_like = (v.contains('_') || v == "BLESS")
+        && v.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if env_like
+        && ["UPDATE", "BLESS", "GOLDEN", "REGENERATE", "OVERWRITE"]
+            .iter()
+            .any(|k| v.contains(k))
+    {
+        return Some(format!("env `{v}`"));
+    }
+    let l = v.to_lowercase();
+    // `SNAPSHOT` alone and `.snapshot` files are too often product terms (DB or gas snapshots).
+    let snapshot_file = l.contains("golden")
+        || l.ends_with(".snap")
+        || l.ends_with(".snap.new")
+        || (l.contains("expected")
+            && [".json", ".ndjson", ".txt", ".out", ".stdout"]
+                .iter()
+                .any(|e| l.ends_with(e)));
+    (snapshot_file && !l.contains(' ')).then(|| format!("`{v}`"))
+}
+
+/// What makes `b` a snapshot comparison: a snapshot macro, a golden env var or path, or a call to
+/// one of `golden_helpers`.
+fn golden_marker(b: &syn::Block, golden_helpers: &HashMap<String, String>) -> Option<String> {
+    struct Find<'h> {
+        helpers: &'h HashMap<String, String>,
+        found: Option<String>,
+    }
+    impl Find<'_> {
+        fn tokens(&mut self, ts: TokenStream) {
+            for tt in ts {
+                match tt {
+                    TokenTree::Literal(l) => {
+                        if let Ok(s) = syn::parse_str::<syn::LitStr>(&l.to_string()) {
+                            self.found = self.found.take().or_else(|| golden_literal(&s.value()));
+                        }
+                    }
+                    TokenTree::Group(g) => self.tokens(g.stream()),
+                    _ => {}
+                }
+            }
+        }
+        fn call(&mut self, name: &str) {
+            if let Some(m) = self.helpers.get(name) {
+                self.found = self
+                    .found
+                    .take()
+                    .or_else(|| Some(format!("`{name}` ({m})")));
+            }
+        }
+    }
+    impl<'a> Visit<'a> for Find<'_> {
+        fn visit_macro(&mut self, m: &'a syn::Macro) {
+            let n = macro_name(m);
+            if SNAPSHOT_MACROS.contains(&n.as_str()) {
+                self.found = self.found.take().or(Some(format!("`{n}!`")));
+            }
+            self.tokens(m.tokens.clone());
+        }
+        fn visit_lit_str(&mut self, l: &'a syn::LitStr) {
+            self.found = self.found.take().or_else(|| golden_literal(&l.value()));
+        }
+        fn visit_expr_call(&mut self, c: &'a syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*c.func
+                && let Some(s) = p.path.segments.last()
+            {
+                self.call(&s.ident.to_string());
+            }
+            syn::visit::visit_expr_call(self, c);
+        }
+        fn visit_expr_method_call(&mut self, c: &'a syn::ExprMethodCall) {
+            self.call(&c.method.to_string());
+            syn::visit::visit_expr_method_call(self, c);
+        }
+    }
+    let mut f = Find {
+        helpers: golden_helpers,
+        found: None,
+    };
+    f.visit_block(b);
+    f.found
 }
 
 /// The block invokes an assert macro or an `assert_*`-style helper.
@@ -210,32 +400,131 @@ fn asserts_anything(b: &syn::Block) -> bool {
     f.0
 }
 
+/// Directory names whose non-`.rs` files are test data.
+const FIXTURE_DIRS: &[&str] = &[
+    "testdata",
+    "test-data",
+    "test_data",
+    "fixtures",
+    "snapshots",
+    "goldens",
+    "golden",
+];
+
+/// Maps paths to their crate: the nearest ancestor directory with a `Cargo.toml`.
+struct Crates<'r> {
+    root: &'r Path,
+    cache: HashMap<PathBuf, String>,
+}
+
+impl Crates<'_> {
+    /// Crate directory of `rel` relative to the root, `.` when only the root (or nothing) has a manifest.
+    fn of(&mut self, rel: &Path) -> String {
+        let mut dir = rel.parent().unwrap_or(Path::new("")).to_path_buf();
+        let mut walked = vec![];
+        let found = loop {
+            if let Some(k) = self.cache.get(&dir) {
+                break k.clone();
+            }
+            walked.push(dir.clone());
+            if self.root.join(&dir).join("Cargo.toml").is_file() {
+                let s = dir.to_string_lossy().into_owned();
+                break if s.is_empty() { ".".to_owned() } else { s };
+            }
+            if !dir.pop() {
+                break ".".to_owned();
+            }
+        };
+        for d in walked {
+            self.cache.insert(d, found.clone());
+        }
+        found
+    }
+}
+
+/// `[package] name` of `<root>/<krate>/Cargo.toml`, and the workspace package names it lists under
+/// normal or build dependencies (including `[target.*]` ones, by `package =` when renamed).
+fn manifest(root: &Path, krate: &str) -> (Option<String>, Vec<String>) {
+    let Some(t) = std::fs::read_to_string(root.join(krate).join("Cargo.toml"))
+        .ok()
+        .and_then(|m| m.parse::<toml::Table>().ok())
+    else {
+        return (None, vec![]);
+    };
+    let name = t
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .map(str::to_owned);
+    fn dep_tables(owner: &toml::Table) -> impl Iterator<Item = &toml::Table> {
+        ["dependencies", "build-dependencies"]
+            .into_iter()
+            .filter_map(|k| owner.get(k)?.as_table())
+    }
+    let targets = t.get("target").and_then(|t| t.as_table());
+    let tables = dep_tables(&t).chain(
+        targets
+            .into_iter()
+            .flat_map(|ts| ts.values().filter_map(|v| v.as_table()))
+            .flat_map(dep_tables),
+    );
+    let deps = tables
+        .flat_map(|d| d.iter())
+        .map(|(k, v)| {
+            v.get("package")
+                .and_then(|p| p.as_str())
+                .unwrap_or(k)
+                .to_owned()
+        })
+        .collect();
+    (name, deps)
+}
+
 /// Parses every `.rs` file under `root` (skipping `target` and `.git`); unparsable files are skipped.
 pub fn scan(root: &Path) -> Scan {
-    let helpers = asserting_helpers(root);
+    let index = index(root);
+    let mut crates = Crates {
+        root,
+        cache: HashMap::new(),
+    };
     let mut out = Scan {
         tests: vec![],
+        support: vec![],
         hits: vec![],
         crates: BTreeMap::new(),
         test_code: HashMap::new(),
+        file_test_loc: HashMap::new(),
+        index: Index {
+            asserting: HashSet::new(),
+            golden: HashMap::new(),
+            ident_counts: HashMap::new(),
+        },
     };
     let mut envelopes: BTreeMap<(String, String), Vec<EnvelopeUse>> = BTreeMap::new();
+    let mut includes: Vec<(String, PathBuf)> = vec![];
     for (rel, src, ast) in rust_files(root) {
         let src_lines: Vec<&str> = src.lines().collect();
         let whole_file = is_test_file(&rel, &ast);
-        let krate = crate_dir(&rel);
+        let krate = crates.of(&rel);
         let mut fs = FileScan {
             file: &rel,
+            krate: &krate,
             src_lines: &src_lines,
             mod_path: file_module_path(&rel),
             in_test: whole_file,
             test_ranges: vec![],
             tests: vec![],
             envelopes: vec![],
-            helpers: &helpers,
+            support: vec![],
+            impls: vec![],
+            includes: vec![],
+            test_only_items_loc: 0,
+            goldens: 0,
+            index: &index,
             hits: &mut out.hits,
         };
         fs.visit_file(&ast);
+        fs.attach_impls();
         let code = if whole_file {
             TestCode::WholeFile
         } else {
@@ -257,17 +546,94 @@ pub fn scan(root: &Path) -> Scan {
                 .or_default()
                 .push(u);
         }
-        let size = out.crates.entry(krate).or_default();
+        includes.extend(fs.includes.into_iter().map(|p| (krate.clone(), p)));
+        let size = out.crates.entry(krate.clone()).or_default();
         size.prod_loc += total - test_loc;
         size.test_loc += test_loc;
         size.tests += fs.tests.len();
+        let src_dir = if krate == "." {
+            PathBuf::from("src")
+        } else {
+            Path::new(&krate).join("src")
+        };
+        size.unit_tests += fs
+            .tests
+            .iter()
+            .filter(|t| t.file.starts_with(&src_dir))
+            .count();
+        size.test_only_items_loc += fs.test_only_items_loc;
+        size.goldens += fs.goldens;
+        for d in fs.support.iter().filter(|s| s.kind == SupportKind::Double) {
+            size.doubles += 1;
+            size.doubles_loc += d.loc;
+        }
         out.tests.extend(fs.tests);
+        out.support.extend(fs.support);
+        out.file_test_loc.insert(rel.clone(), test_loc);
         out.test_code.insert(rel, code);
     }
+    count_fixtures(root, &mut crates, includes, &mut out.crates);
+    let manifests: Vec<(String, Option<String>, Vec<String>)> = out
+        .crates
+        .keys()
+        .map(|k| {
+            let (name, deps) = manifest(root, k);
+            (k.clone(), name, deps)
+        })
+        .collect();
+    for (krate, name, _) in &manifests {
+        let size = out
+            .crates
+            .get_mut(krate)
+            .expect("manifests are read for existing crates");
+        size.package = name.clone();
+        size.used_by = name.as_ref().map_or(0, |n| {
+            manifests
+                .iter()
+                .filter(|(k, _, deps)| k != krate && deps.contains(n))
+                .count()
+        });
+    }
+    out.index = index;
     envelope_hits(envelopes, &mut out.hits);
     clone_hits(&out.tests, &mut out.hits);
     fixture_hits(&out.tests, &mut out.hits);
+    out.hits.extend(crate::suite::static_hits(&out));
     out
+}
+
+/// Adds the lines of every test data file to its crate's `fixture_loc`: non-`.rs` files under a
+/// `FIXTURE_DIRS` directory or `tests/`, and the `include_str!`/`include_bytes!` targets of test
+/// code (resolved paths relative to the root, with the including crate). Non-UTF-8 files are skipped.
+fn count_fixtures(
+    root: &Path,
+    crates: &mut Crates,
+    includes: Vec<(String, PathBuf)>,
+    sizes: &mut BTreeMap<String, CrateSize>,
+) {
+    let mut counted: HashSet<PathBuf> = HashSet::new();
+    let data_files = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| e.file_name() != "target" && e.file_name() != ".git")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_none_or(|x| x != "rs"))
+        .filter_map(|e| e.path().strip_prefix(root).ok().map(Path::to_path_buf))
+        .filter(|rel| {
+            rel.components().any(|c| {
+                let c = c.as_os_str().to_string_lossy();
+                FIXTURE_DIRS.contains(&c.as_ref()) || c == "tests"
+            })
+        })
+        .map(|rel| (crates.of(&rel), rel))
+        .collect::<Vec<_>>();
+    for (krate, rel) in data_files.into_iter().chain(includes) {
+        if !counted.insert(rel.clone()) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(root.join(&rel)) {
+            sizes.entry(krate).or_default().fixture_loc += text.lines().count();
+        }
+    }
 }
 
 /// Module path of a file under a crate's `src/`, `None` elsewhere.
@@ -284,17 +650,6 @@ fn file_module_path(rel: &Path) -> Option<Vec<String>> {
         path.push(stem.to_owned());
     }
     Some(path)
-}
-
-fn crate_dir(rel: &Path) -> String {
-    let comps: Vec<_> = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect();
-    let cut = comps
-        .iter()
-        .position(|c| c == "src" || c == "tests" || c == "benches");
-    comps[..cut.unwrap_or(comps.len().saturating_sub(1))].join("/")
 }
 
 fn attr_path(a: &syn::Attribute) -> String {
@@ -1018,6 +1373,7 @@ fn divider_hits(file: &Path, src: &[&str], code: &TestCode, hits: &mut Vec<Hit>)
 
 struct FileScan<'a> {
     file: &'a Path,
+    krate: &'a str,
     src_lines: &'a [&'a str],
     /// `None` outside a crate's `src/`, where the harness name is not derivable.
     mod_path: Option<Vec<String>>,
@@ -1025,8 +1381,14 @@ struct FileScan<'a> {
     test_ranges: Vec<RangeInclusive<usize>>,
     tests: Vec<TestFn>,
     envelopes: Vec<EnvelopeUse>,
-    /// See `asserting_helpers`.
-    helpers: &'a HashSet<String>,
+    support: Vec<Support>,
+    /// (self type, lines, identifier counts) of impl blocks in test code, attached to doubles.
+    impls: Vec<(String, usize, HashMap<String, usize>)>,
+    /// Paths (relative to the root) that test code `include_str!`s or `include_bytes!`s.
+    includes: Vec<PathBuf>,
+    test_only_items_loc: usize,
+    goldens: usize,
+    index: &'a Index,
     hits: &'a mut Vec<Hit>,
 }
 
@@ -1062,7 +1424,21 @@ impl<'ast> Visit<'ast> for FileScan<'_> {
     }
     fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
         if !f.attrs.iter().any(is_test_attr) {
-            return syn::visit::visit_item_fn(self, f);
+            let was = self.gate(&f.attrs, f);
+            if self.in_test && !intentionally_unused(&f.attrs, &f.sig.ident) {
+                self.support.push(Support {
+                    kind: SupportKind::Helper,
+                    name: f.sig.ident.to_string(),
+                    file: self.file.into(),
+                    krate: self.krate.into(),
+                    line: f.span().start().line,
+                    loc: lines(f),
+                    idents: ident_counts(f.to_token_stream()),
+                });
+            }
+            syn::visit::visit_item_fn(self, f);
+            self.in_test = was;
+            return;
         }
         let should_panic = f.attrs.iter().any(|a| attr_path(a) == "should_panic");
         let mut sig_inputs = BTreeSet::new();
@@ -1084,12 +1460,162 @@ impl<'ast> Visit<'ast> for FileScan<'_> {
             sig_inputs,
         );
     }
+    fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
+        let was = self.gate(&i.attrs, i);
+        self.double(&i.ident, i);
+        syn::visit::visit_item_struct(self, i);
+        self.in_test = was;
+    }
+    fn visit_item_enum(&mut self, i: &'ast syn::ItemEnum) {
+        let was = self.gate(&i.attrs, i);
+        self.double(&i.ident, i);
+        syn::visit::visit_item_enum(self, i);
+        self.in_test = was;
+    }
+    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+        let was = self.gate(&i.attrs, i);
+        if self.in_test
+            && let syn::Type::Path(p) = &*i.self_ty
+            && let Some(seg) = p.path.segments.last()
+        {
+            self.impls.push((
+                seg.ident.to_string(),
+                lines(i),
+                ident_counts(i.to_token_stream()),
+            ));
+        }
+        syn::visit::visit_item_impl(self, i);
+        self.in_test = was;
+    }
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
         self.macro_tests(m.tokens.clone());
+        if self.in_test && matches!(macro_name(m).as_str(), "include_str" | "include_bytes") {
+            self.include(m.tokens.clone());
+        }
     }
 }
 
+/// Identifier occurrences in `ts`.
+fn ident_counts(ts: TokenStream) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    let mut stack = vec![ts];
+    while let Some(ts) = stack.pop() {
+        for tt in ts {
+            match tt {
+                TokenTree::Ident(i) => *counts.entry(i.to_string()).or_default() += 1,
+                TokenTree::Group(g) => stack.push(g.stream()),
+                _ => {}
+            }
+        }
+    }
+    counts
+}
+
+/// `#[allow(dead_code)]`/`#[expect(dead_code)]` or a `_` name: unused on purpose, like a
+/// compile-time `Send` check.
+fn intentionally_unused(attrs: &[syn::Attribute], ident: &syn::Ident) -> bool {
+    ident.to_string().starts_with('_')
+        || attrs.iter().any(|a| {
+            matches!(attr_path(a).as_str(), "allow" | "expect")
+                && a.meta.to_token_stream().to_string().contains("dead_code")
+        })
+}
+
+/// `Fake*`, `Mock*`, `Stub*`, `Dummy*`, `Spy*`, `Noop*` (or exactly one of those words).
+fn is_double_name(name: &str) -> bool {
+    ["Fake", "Mock", "Stub", "Dummy", "Spy", "Noop"]
+        .iter()
+        .any(|p| {
+            name.strip_prefix(p).is_some_and(|rest| {
+                rest.is_empty()
+                    || rest.starts_with(|c: char| c.is_ascii_uppercase() || c.is_ascii_digit())
+            })
+        })
+}
+
 impl FileScan<'_> {
+    /// Enters a `#[cfg(test)]` item outside test code: counts it as test code and returns the
+    /// previous `in_test` for the caller to restore.
+    fn gate(&mut self, attrs: &[syn::Attribute], item: &impl Spanned) -> bool {
+        let was = self.in_test;
+        if !was && is_cfg_test(attrs) {
+            let sp = item.span();
+            self.test_ranges.push(sp.start().line..=sp.end().line);
+            self.test_only_items_loc += lines(item);
+            self.in_test = true;
+        }
+        was
+    }
+
+    fn double(&mut self, ident: &syn::Ident, item: &(impl Spanned + ToTokens)) {
+        let name = ident.to_string();
+        if self.in_test && is_double_name(&name) {
+            self.support.push(Support {
+                kind: SupportKind::Double,
+                name,
+                file: self.file.into(),
+                krate: self.krate.into(),
+                line: item.span().start().line,
+                loc: lines(item),
+                idents: ident_counts(item.to_token_stream()),
+            });
+        }
+    }
+
+    /// Adds each impl block of a double's type in this file to the double.
+    fn attach_impls(&mut self) {
+        for (ty, loc, idents) in std::mem::take(&mut self.impls) {
+            if let Some(d) = self
+                .support
+                .iter_mut()
+                .find(|s| s.kind == SupportKind::Double && s.name == ty)
+            {
+                d.loc += loc;
+                for (k, v) in idents {
+                    *d.idents.entry(k).or_default() += v;
+                }
+            }
+        }
+    }
+
+    /// Records the file an `include_str!`/`include_bytes!` reads: a literal relative to this file,
+    /// or `concat!(env!("CARGO_MANIFEST_DIR"), "/rel")` relative to the crate.
+    fn include(&mut self, ts: TokenStream) {
+        let text = ts.to_string();
+        let lits: Vec<String> = ts
+            .into_iter()
+            .flat_map(|tt| match tt {
+                TokenTree::Group(g) => g.stream().into_iter().collect::<Vec<_>>(),
+                other => vec![other],
+            })
+            .filter_map(|tt| match tt {
+                TokenTree::Literal(l) => syn::parse_str::<syn::LitStr>(&l.to_string())
+                    .ok()
+                    .map(|s| s.value()),
+                _ => None,
+            })
+            .filter(|v| v != "CARGO_MANIFEST_DIR")
+            .collect();
+        let Some(path) = lits.last() else { return };
+        let base = if text.contains("CARGO_MANIFEST_DIR") {
+            PathBuf::from(if self.krate == "." { "" } else { self.krate })
+        } else {
+            self.file.parent().unwrap_or(Path::new("")).to_path_buf()
+        };
+        let joined = base.join(path.trim_start_matches('/'));
+        // Lexically drop `..` so the path matches the walk's relative paths.
+        let mut norm = PathBuf::new();
+        for c in joined.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    norm.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => norm.push(other),
+            }
+        }
+        self.includes.push(norm);
+    }
     /// Records `#[test] fn name(..) { .. }` items inside a macro body, as `proptest!` writes them.
     fn macro_tests(&mut self, ts: TokenStream) {
         let tts: Vec<TokenTree> = ts.into_iter().collect();
@@ -1158,7 +1684,7 @@ impl FileScan<'_> {
             inputs: sig_inputs,
             panic_path: false,
             repeated: None,
-            helpers: self.helpers,
+            helpers: &self.index.asserting,
             hits: self.hits,
         };
         body.visit_block(block);
@@ -1179,6 +1705,16 @@ impl FileScan<'_> {
                 &name,
                 saved,
                 format!("block repeated x{n}"),
+            );
+        }
+        if let Some(marker) = golden_marker(block, &self.index.golden) {
+            self.goldens += 1;
+            self.hit(
+                Lint::CharacterizationGolden,
+                line,
+                &name,
+                loc,
+                format!("compares against a stored snapshot via {marker}: it detects change, so keep it only for output that is a contract"),
             );
         }
 
@@ -1235,6 +1771,7 @@ impl FileScan<'_> {
         });
         self.tests.push(TestFn {
             file: self.file.into(),
+            krate: self.krate.into(),
             harness_name,
             name,
             line,
@@ -1389,16 +1926,26 @@ mod tests {
         let ast = syn::parse_file(src).expect("fixture parses");
         let lines: Vec<&str> = src.lines().collect();
         let mut hits = vec![];
-        let helpers = ["execute_case".to_owned()].into();
+        let index = Index {
+            asserting: ["execute_case".to_owned()].into(),
+            golden: [("check_golden".to_owned(), "env `UPDATE_GOLDEN`".to_owned())].into(),
+            ident_counts: HashMap::new(),
+        };
         let mut fs = FileScan {
             file: Path::new("src/lib.rs"),
+            krate: ".",
             src_lines: &lines,
             mod_path: Some(vec![]),
             in_test: true,
             test_ranges: vec![],
             tests: vec![],
             envelopes: vec![],
-            helpers: &helpers,
+            support: vec![],
+            impls: vec![],
+            includes: vec![],
+            test_only_items_loc: 0,
+            goldens: 0,
+            index: &index,
             hits: &mut hits,
         };
         fs.visit_file(&ast);
@@ -1519,6 +2066,122 @@ mod tests {
         let same = vec![false; holes.len()];
         // Identical bodies: 14 - (7 + 2 + 2).
         assert_eq!(table_saving(&[&t[0], &t[1]], &same), 3);
+    }
+
+    #[test]
+    fn golden_literals_are_update_env_vars_or_snapshot_paths() {
+        assert_eq!(
+            golden_literal("TEMPO_DST_UPDATE_GOLDEN"),
+            Some("env `TEMPO_DST_UPDATE_GOLDEN`".into())
+        );
+        assert_eq!(
+            golden_literal("/testdata/expected.ndjson"),
+            Some("`/testdata/expected.ndjson`".into())
+        );
+        assert_eq!(
+            golden_literal("snapshots/a.snap"),
+            Some("`snapshots/a.snap`".into())
+        );
+        assert_eq!(golden_literal("UPDATE"), None);
+        assert_eq!(golden_literal("expected a golden value"), None);
+        assert_eq!(golden_literal("RUST_LOG"), None);
+        assert_eq!(golden_literal("FORGE_SNAPSHOT_CHECK"), None);
+        assert_eq!(golden_literal("db/new.snapshot"), None);
+        assert_eq!(
+            golden_literal("INSTA_UPDATE"),
+            Some("env `INSTA_UPDATE`".into())
+        );
+    }
+
+    #[test]
+    fn doubles_are_named_by_a_prefix_word() {
+        assert!(is_double_name("FakeChain"));
+        assert!(is_double_name("Mock"));
+        assert!(is_double_name("Stub2"));
+        assert!(!is_double_name("Faker"));
+        assert!(!is_double_name("TestEnv"));
+    }
+
+    #[test]
+    fn includes_resolve_relative_to_the_file_or_the_crate() {
+        let src = r#"
+            #[cfg(test)]
+            mod t {
+                const A: &str = include_str!("../testdata/a.json");
+                const B: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/b.json"));
+            }
+        "#;
+        let ast = syn::parse_file(src).expect("parses");
+        let lines: Vec<&str> = src.lines().collect();
+        let index = Index {
+            asserting: HashSet::new(),
+            golden: HashMap::new(),
+            ident_counts: HashMap::new(),
+        };
+        let mut hits = vec![];
+        let mut fs = FileScan {
+            file: Path::new("crates/x/src/a.rs"),
+            krate: "crates/x",
+            src_lines: &lines,
+            mod_path: None,
+            in_test: false,
+            test_ranges: vec![],
+            tests: vec![],
+            envelopes: vec![],
+            support: vec![],
+            impls: vec![],
+            includes: vec![],
+            test_only_items_loc: 0,
+            goldens: 0,
+            index: &index,
+            hits: &mut hits,
+        };
+        fs.visit_file(&ast);
+        assert_eq!(
+            fs.includes,
+            [
+                PathBuf::from("crates/x/testdata/a.json"),
+                PathBuf::from("crates/x/testdata/b.json")
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_lists_normal_and_build_dependencies_by_package() {
+        let dir = std::env::temp_dir().join(format!("testslop-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("c")).unwrap();
+        std::fs::write(
+            dir.join("c/Cargo.toml"),
+            r#"
+            [package]
+            name = "c"
+            [dependencies]
+            a = "1"
+            b = { package = "real-b", version = "1" }
+            [dev-dependencies]
+            dev-only = "1"
+            [build-dependencies]
+            builder = "1"
+            [target.'cfg(unix)'.dependencies]
+            unix-only = "1"
+            "#,
+        )
+        .unwrap();
+        let (name, mut deps) = manifest(&dir, "c");
+        deps.sort();
+        assert_eq!(name.as_deref(), Some("c"));
+        assert_eq!(deps, ["a", "builder", "real-b", "unix-only"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dead_code_allowances_and_underscore_names_are_intentionally_unused() {
+        let f: syn::ItemFn = syn::parse_quote! { #[expect(dead_code)] fn send_check() {} };
+        assert!(intentionally_unused(&f.attrs, &f.sig.ident));
+        let f: syn::ItemFn = syn::parse_quote! { fn _compile_check() {} };
+        assert!(intentionally_unused(&f.attrs, &f.sig.ident));
+        let f: syn::ItemFn = syn::parse_quote! { #[allow(clippy::foo)] fn helper() {} };
+        assert!(!intentionally_unused(&f.attrs, &f.sig.ident));
     }
 
     #[test]
