@@ -61,6 +61,12 @@ fn scan_reports_each_static_lint_once() {
             ("characterization_golden", "render_matches_golden"),
             ("duplicate_test_double", "FakeStore"),
             ("orphaned_test_helper", "unused_helper"),
+            ("silent_skip", "needs_tool"),
+            ("silent_skip", "ignored_without_reason"),
+            ("tests_trivial_code", "point_fields"),
+            ("tests_trivial_code", "config_clone_eq"),
+            ("tests_upstream_only", "std_vec_len"),
+            ("tests_upstream_only", "sample_is_21"),
         ])
     );
 }
@@ -152,6 +158,9 @@ fn cov_triages_coverage_redundant_tests() {
         pairs(&[
             ("no_prod_coverage", "tests::point_fields"),
             ("no_prod_coverage", "tests::fake_store_reads_origin"),
+            ("no_prod_coverage", "tests::needs_tool"),
+            ("no_prod_coverage", "tests::config_clone_eq"),
+            ("no_prod_coverage", "tests::std_vec_len"),
             ("no_prod_coverage", "test_util::tests::sample_is_21"),
             ("duplicate_coverage", "tests::double_two_again"),
             ("duplicate_coverage", "tests::parse_ok_via_helper"),
@@ -159,15 +168,26 @@ fn cov_triages_coverage_redundant_tests() {
             ("same_path_different_inputs", "tests::double_two"),
             ("same_path_different_inputs", "tests::parse_rejects_sign"),
             ("orphaned_test_helper", "seven"),
+            ("unexecuted_assertion", "tests::needs_tool"),
+            ("unexecuted_assertion", "tests::loop_over_nothing"),
         ])
     );
+    // Removals carry the run time they save; merges and broken tests do not.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    for h in v.as_array().unwrap() {
+        let removal = matches!(
+            h["lint"].as_str().unwrap(),
+            "no_prod_coverage" | "duplicate_coverage" | "subsumed_coverage"
+        );
+        assert_eq!(h["saved_ms"].is_u64(), removal, "{h}");
+    }
 
     let report = testslop(&["cov", FIXTURE, "-p", "demo", "--jobs", "4"]);
     let stdout = String::from_utf8_lossy(&report.stdout);
     assert_eq!(
         stdout.lines().nth(1),
         Some(
-            "   not reported: 15 covered by another test but asserting something it does not, 1 #[should_panic], 0 macro-generated"
+            "   not reported: 16 covered by another test but asserting something it does not, 1 #[should_panic], 0 macro-generated"
         ),
     );
     std::fs::remove_dir_all(&cwd).unwrap();
@@ -251,8 +271,8 @@ fn crates_reports_fixtures_test_only_items_doubles_and_goldens() {
         c["test_only_items_loc"], 6,
         "the #[cfg(test)] impl of Point"
     );
-    assert_eq!(c["unit_tests"], 30);
-    assert_eq!(c["tests"], 31);
+    assert_eq!(c["unit_tests"], 36);
+    assert_eq!(c["tests"], 37);
     assert_eq!(c["goldens"], 1);
     assert_eq!(c["doubles"], 2);
 }

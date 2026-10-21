@@ -31,6 +31,20 @@ impl Point {
 #[cfg(test)]
 pub mod test_util;
 
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Config {
+    pub n: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Celsius(pub i32);
+
+impl PartialEq for Celsius {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
 pub fn with_ctx<T>(f: impl FnOnce(&mut u32) -> T) -> T {
     let mut ctx = 0;
     f(&mut ctx)
@@ -192,6 +206,50 @@ mod tests {
     fn fake_store_reads_origin() {
         let p = Point::origin();
         assert_eq!(FakeStore { value: p.x }.get(), 0);
+    }
+
+    #[test]
+    fn needs_tool() {
+        if std::env::var("DEMO_TOOL").is_err() {
+            eprintln!("skipping: DEMO_TOOL is not set");
+            return;
+        }
+        assert_eq!(double(1), 2);
+    }
+
+    #[test]
+    #[ignore]
+    fn ignored_without_reason() {
+        assert_eq!(double(2), 4);
+    }
+
+    #[test]
+    fn config_clone_eq() {
+        let c = Config { n: 1 };
+        assert_eq!(c.clone(), c);
+    }
+
+    #[test]
+    fn celsius_compare() {
+        let a = Celsius(1);
+        let b = Celsius(1);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn std_vec_len() {
+        assert_eq!(vec![1, 2].len(), 2);
+    }
+
+    #[test]
+    fn loop_over_nothing() {
+        let items: Vec<u32> = vec![];
+        for i in &items {
+            assert_eq!(double(*i), i * 2);
+        }
+        if let Ok(n) = parse("x") {
+            assert_eq!(n, 0);
+        }
     }
 
     // --- repeated blocks and shared setup ---

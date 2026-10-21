@@ -38,6 +38,46 @@ pub fn static_hits(scan: &Scan) -> Vec<Hit> {
     let mut hits = meta_test_hits(scan);
     hits.extend(double_hits(scan));
     hits.extend(orphan_hits(scan, &[]));
+    hits.extend(upstream_only_hits(scan));
+    hits
+}
+
+/// Tests that reach no name production code defines, directly or through test helpers they call.
+fn upstream_only_hits(scan: &Scan) -> Vec<Hit> {
+    let helpers: BTreeMap<&str, &Support> = scan
+        .support
+        .iter()
+        .filter(|s| s.kind == SupportKind::Helper)
+        .map(|s| (s.name.as_str(), s))
+        .collect();
+    let mut hits = vec![];
+    for t in &scan.tests {
+        let mut reach: HashSet<&str> = t.idents().collect();
+        let mut frontier: Vec<&str> = reach
+            .iter()
+            .copied()
+            .filter(|i| helpers.contains_key(i))
+            .collect();
+        while let Some(h) = frontier.pop() {
+            for i in helpers[h].idents() {
+                if reach.insert(i) && helpers.contains_key(i) {
+                    frontier.push(i);
+                }
+            }
+        }
+        if reach.iter().any(|i| scan.index.prod_names.contains(*i)) {
+            continue;
+        }
+        hits.push(Hit {
+            lint: Lint::TestsUpstreamOnly,
+            file: t.file.clone(),
+            line: t.line,
+            item: t.name.clone(),
+            saved_loc: t.loc,
+            saved_ms: None,
+            detail: "reaches nothing production code defines: it tests std, a dependency, or test helpers".into(),
+        });
+    }
     hits
 }
 
@@ -67,6 +107,7 @@ fn meta_test_hits(scan: &Scan) -> Vec<Hit> {
             .filter(|t| &t.krate == krate && t.file.starts_with(&src))
             .collect();
         hits.push(Hit {
+            saved_ms: None,
             lint: Lint::MetaTests,
             file: PathBuf::from(krate),
             line: 0,
@@ -99,6 +140,7 @@ fn meta_test_hits(scan: &Scan) -> Vec<Hit> {
     }
     for (file, tests) in by_file {
         hits.push(Hit {
+            saved_ms: None,
             lint: Lint::MetaTests,
             file: file.into(),
             line: tests[0].line,
@@ -145,6 +187,7 @@ fn double_hits(scan: &Scan) -> Vec<Hit> {
         let total: usize = files.values().sum();
         let largest = files.values().copied().max().unwrap_or(0);
         hits.push(Hit {
+            saved_ms: None,
             lint: Lint::DuplicateTestDouble,
             file: defs[0].file.clone(),
             line: defs[0].line,
@@ -170,6 +213,7 @@ fn double_hits(scan: &Scan) -> Vec<Hit> {
         let test_loc = scan.file_test_loc.get(file).copied().unwrap_or(0);
         if fake_heavy(loc, test_loc) {
             hits.push(Hit {
+                saved_ms: None,
                 lint: Lint::FakeHeavyTests,
                 file: file.into(),
                 line: ds[0].line,
@@ -221,6 +265,7 @@ pub fn orphan_hits(scan: &Scan, removed: &[&TestFn]) -> Vec<Hit> {
                 .map(|t| t.name.as_str())
                 .collect();
             Hit {
+                saved_ms: None,
                 lint: Lint::OrphanedTestHelper,
                 file: s.file.clone(),
                 line: s.line,

@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -475,13 +476,20 @@ fn merge(cfg: &CovConfig, raws: &[PathBuf], out: &Path) -> Result<(), CovError> 
     Ok(())
 }
 
-/// Production regions `profdata` counts as executed in `object`; deletes `profdata`.
+/// A test function's own source: its file and line range.
+type Focus<'a> = (&'a Path, RangeInclusive<usize>);
+/// Code regions of a test function's own source, with their execution counts.
+type OwnRegions = Vec<([u64; 4], u64)>;
+
+/// Production regions `profdata` counts as executed in `object`, and every code region (with its
+/// count) inside `focus`; deletes `profdata`.
 fn export_regions(
     cfg: &CovConfig,
     scan: &Scan,
     profdata: &Path,
     object: &Path,
-) -> Result<HashSet<Region>, CovError> {
+    focus: Option<&Focus>,
+) -> Result<(HashSet<Region>, OwnRegions), CovError> {
     let llvm_cov = cfg.llvm_bin.join("llvm-cov");
     let mut export = Command::new(&llvm_cov)
         .args(["export", "-format=text", "-skip-expansions"])
@@ -497,10 +505,11 @@ fn export_regions(
         })?;
     let stdout = export.stdout.take().expect("stdout is piped");
     let mut covered = HashSet::new();
+    let mut own = vec![];
     let mut sink = |f: ExportFn| {
         for r in &f.regions {
             let [ls, cs, le, ce, count, file_id, _, kind] = *r;
-            if count == 0 || kind != CODE_REGION {
+            if kind != CODE_REGION {
                 continue;
             }
             let Some(rel) = usize::try_from(file_id)
@@ -510,7 +519,13 @@ fn export_regions(
             else {
                 continue;
             };
-            if !cfg.prod_dirs.iter().any(|d| rel.starts_with(d)) {
+            if let Some((file, lines)) = focus
+                && rel == *file
+                && usize::try_from(ls).is_ok_and(|l| lines.contains(&l))
+            {
+                own.push(([ls, cs, le, ce], count));
+            }
+            if count == 0 || !cfg.prod_dirs.iter().any(|d| rel.starts_with(d)) {
                 continue;
             }
             let is_test = usize::try_from(ls)
@@ -532,18 +547,28 @@ fn export_regions(
         });
     }
     parsed.map_err(CovError::Json)?;
-    Ok(covered)
+    Ok((covered, own))
 }
 
-/// Runs one test alone and returns the production regions it executed.
+/// One test's run: the production regions it executed, the code regions of its own function with
+/// their counts, and its wall time.
+struct TestRun {
+    regions: HashSet<Region>,
+    own: OwnRegions,
+    wall: Duration,
+}
+
+/// Runs one test alone; `focus` is its own function's source, whose regions are kept with counts.
 fn cover_one(
     cfg: &CovConfig,
     scan: &Scan,
     idx: usize,
     test: &str,
-) -> Result<HashSet<Region>, CovError> {
+    focus: Option<&Focus>,
+) -> Result<TestRun, CovError> {
     let raw = cfg.work_dir.join(format!("{idx}.profraw"));
     let data = cfg.work_dir.join(format!("{idx}.profdata"));
+    let started = Instant::now();
     let status = run_bounded(
         Command::new(cfg.bin)
             .args(["--exact", test, "--test-threads=1", "-q"])
@@ -551,6 +576,7 @@ fn cover_one(
         TEST_TIMEOUT,
         &cfg.bin.display().to_string(),
     )?;
+    let wall = started.elapsed();
     if !status.success() {
         if raw.exists() {
             std::fs::remove_file(&raw).map_err(CovError::Io)?;
@@ -562,7 +588,8 @@ fn cover_one(
         });
     }
     merge(cfg, std::slice::from_ref(&raw), &data)?;
-    export_regions(cfg, scan, &data, cfg.bin)
+    let (regions, own) = export_regions(cfg, scan, &data, cfg.bin, focus)?;
+    Ok(TestRun { regions, own, wall })
 }
 
 /// Runs the whole `--against` suite once and returns the production regions it executed.
@@ -597,7 +624,17 @@ fn cover_suite(
         .collect();
     let data = cfg.work_dir.join("against.profdata");
     merge(cfg, &raws, &data)?;
-    export_regions(cfg, scan, &data, bin)
+    Ok(export_regions(cfg, scan, &data, bin, None)?.0)
+}
+
+/// Count of the smallest region in `own` containing `line` and 0-based `col` (llvm columns are
+/// 1-based); `None` when no region contains it (macro expansions, untracked code).
+fn innermost_count(own: &[([u64; 4], u64)], line: usize, col: usize) -> Option<u64> {
+    let (l, c) = (u64::try_from(line).ok()?, u64::try_from(col).ok()? + 1);
+    own.iter()
+        .filter(|([ls, cs, le, ce], _)| (*ls, *cs) <= (l, c) && (l, c) <= (*le, *ce))
+        .min_by_key(|([ls, cs, le, ce], _)| (le - ls, ce.abs_diff(*cs)))
+        .map(|(_, n)| *n)
 }
 
 /// Delete sorts before Table, so the strongest verdict wins.
@@ -633,8 +670,13 @@ pub struct CovReport {
 pub fn analyze(cfg: &CovConfig, scan: &Scan) -> Result<CovReport, CovError> {
     std::fs::create_dir_all(cfg.work_dir).map_err(CovError::Io)?;
     let tests = list_tests(cfg.bin, cfg.work_dir)?;
+    let by_harness: HashMap<&str, &crate::scan::TestFn> = scan
+        .tests
+        .iter()
+        .filter_map(|t| Some((t.harness_name.as_deref()?, t)))
+        .collect();
     let next = Mutex::new(0usize);
-    let results = Mutex::new(Vec::<(usize, Result<HashSet<Region>, CovError>)>::new());
+    let results = Mutex::new(Vec::<(usize, Result<TestRun, CovError>)>::new());
     std::thread::scope(|s| {
         for _ in 0..cfg.jobs.max(1) {
             s.spawn(|| {
@@ -648,7 +690,10 @@ pub fn analyze(cfg: &CovConfig, scan: &Scan) -> Result<CovReport, CovError> {
                         i
                     };
                     let Some(test) = tests.get(idx) else { break };
-                    let r = cover_one(cfg, scan, idx, test);
+                    let focus = by_harness
+                        .get(test.as_str())
+                        .map(|t| (t.file.as_path(), t.line..=t.line + t.loc - 1));
+                    let r = cover_one(cfg, scan, idx, test, focus.as_ref());
                     let mut res = results
                         .lock()
                         .expect("no worker panics while holding the lock");
@@ -664,9 +709,12 @@ pub fn analyze(cfg: &CovConfig, scan: &Scan) -> Result<CovReport, CovError> {
     let mut ids: HashMap<Region, usize> = HashMap::new();
     let mut sets: Vec<(usize, Vec<usize>)> = vec![];
     let mut failed = vec![];
+    // Per test index: its own function's regions with counts, and its wall time.
+    let mut runs: HashMap<usize, (OwnRegions, Duration)> = HashMap::new();
     for (idx, r) in results.into_inner().expect("workers have exited") {
         match r {
-            Ok(regions) => {
+            Ok(TestRun { regions, own, wall }) => {
+                runs.insert(idx, (own, wall));
                 let mut v: Vec<usize> = regions
                     .into_iter()
                     .map(|r| {
@@ -693,11 +741,6 @@ pub fn analyze(cfg: &CovConfig, scan: &Scan) -> Result<CovReport, CovError> {
         })
         .collect();
 
-    let by_harness: HashMap<&str, &crate::scan::TestFn> = scan
-        .tests
-        .iter()
-        .filter_map(|t| Some((t.harness_name.as_deref()?, t)))
-        .collect();
     let mut hits = vec![];
     let mut triage = Triage::default();
     for i in 0..sets.len() {
@@ -708,6 +751,7 @@ pub fn analyze(cfg: &CovConfig, scan: &Scan) -> Result<CovReport, CovError> {
         };
         // A test merged into a table still costs a row of about three lines.
         let hit = |lint, detail| Hit {
+            saved_ms: None,
             lint,
             file: t.file.clone(),
             line: t.line,
@@ -826,6 +870,7 @@ pub fn analyze(cfg: &CovConfig, scan: &Scan) -> Result<CovReport, CovError> {
                     .all(|&r| regions[r].is_some_and(|r| suite.contains(r)));
             if in_suite && !t.should_panic && !reported.contains(name) {
                 covered_hits.push(Hit {
+                    saved_ms: None,
                     lint: Lint::CoveredBySuite,
                     file: t.file.clone(),
                     line: t.line,
@@ -836,6 +881,57 @@ pub fn analyze(cfg: &CovConfig, scan: &Scan) -> Result<CovReport, CovError> {
             }
         }
         hits.extend(covered_hits);
+    }
+
+    // Assertions whose innermost code region never ran while the test passed.
+    for (idx, _) in &sets {
+        let (Some(t), Some((own, _))) = (by_harness.get(tests[*idx].as_str()), runs.get(idx))
+        else {
+            continue;
+        };
+        if t.should_panic {
+            continue;
+        }
+        let unexecuted: Vec<&(usize, usize, String)> = t
+            .assert_sites
+            .iter()
+            .filter(|(line, col, _)| innermost_count(own, *line, *col) == Some(0))
+            .collect();
+        if let Some((line, _, what)) = unexecuted.first() {
+            hits.push(Hit {
+                lint: Lint::UnexecutedAssertion,
+                file: t.file.clone(),
+                line: *line,
+                item: tests[*idx].clone(),
+                saved_loc: 0,
+                saved_ms: None,
+                detail: format!(
+                    "{} of {} assertions never ran (first `{what}` at line {line}); the test passes without checking them",
+                    unexecuted.len(),
+                    t.assert_sites.len()
+                ),
+            });
+        }
+    }
+
+    // Run time each removal saves: wall time above the fastest test, which is process overhead.
+    let fastest = runs.values().map(|r| r.1).min().unwrap_or_default();
+    let wall_of: HashMap<&str, Duration> = runs
+        .iter()
+        .map(|(i, r)| (tests[*i].as_str(), r.1))
+        .collect();
+    for h in hits.iter_mut().filter(|h| {
+        matches!(
+            h.lint,
+            Lint::DuplicateCoverage
+                | Lint::SubsumedCoverage
+                | Lint::NoProdCoverage
+                | Lint::CoveredBySuite
+        )
+    }) {
+        h.saved_ms = wall_of
+            .get(h.item.as_str())
+            .map(|w| u64::try_from(w.saturating_sub(fastest).as_millis()).unwrap_or(u64::MAX));
     }
 
     let mut cover_count = vec![0u32; ids.len()];
@@ -914,4 +1010,23 @@ pub fn default_llvm_bin(root: &Path) -> Result<PathBuf, CovError> {
         .join("lib/rustlib")
         .join(host)
         .join("bin"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn innermost_count_takes_the_smallest_containing_region() {
+        // A body (count 1) with an untaken branch (count 0) on lines 3..=5.
+        let own = [([1, 1, 9, 2], 1), ([3, 10, 5, 6], 0)];
+        assert_eq!(innermost_count(&own, 4, 8), Some(0));
+        assert_eq!(innermost_count(&own, 2, 4), Some(1));
+        assert_eq!(
+            innermost_count(&own, 3, 2),
+            Some(1),
+            "before the branch opens on line 3"
+        );
+        assert_eq!(innermost_count(&own, 12, 0), None);
+    }
 }

@@ -48,11 +48,19 @@ Production code is the package's `src/` minus `#[cfg(test)]` modules, test funct
 | `duplicate_test_double` | scan | the same `Fake*`/`Mock*`/`Stub*`/`Dummy*`/`Spy*`/`Noop*` type defined in several files of a crate |
 | `fake_heavy_tests` | scan | a file whose test doubles are 60+ lines and a quarter or more of its test code |
 | `orphaned_test_helper` | scan, cov | a test helper or double nothing references (`pub` ones rustc does not warn about); with `cov`, also those only deletion candidates use |
+| `silent_skip` | scan | returns early on an environment check (env var, tool availability, path existence, `cfg!`, CI) or is `#[ignore]`d without a reason; `if !is_ci() { return }` (CI-only) is fine |
+| `tests_trivial_code` | scan | every assertion reads back a field or getter of a value built from the same literal, or the test only uses impls its types `#[derive]` (not hand-written, and serde not configured by `#[serde(..)]`) |
+| `tests_upstream_only` | scan | reaches no name production code defines (types, free functions, distinctive methods, identifiers in item macros like `sol!`), even through test helpers |
 | `no_prod_coverage` | cov | runs no production code: tests generated code (derives, `thiserror`, `sol!`), upstream crates, or test helpers |
 | `duplicate_coverage` | cov | same regions as another test, with the same inputs and only assertions that test repeats: delete |
 | `subsumed_coverage` | cov | as above, but the other test covers strictly more |
 | `same_path_different_inputs` | cov | runs no code beyond another test, with other inputs (a near-clone, or the same assertions): one table |
 | `covered_by_suite` | cov `--against` | every region the unit test runs, the `--against` suite runs too |
+| `unexecuted_assertion` | cov | an assertion whose innermost code region never ran while its test passed (untaken branch, empty loop, closure never called) |
+
+`cov` also times each test; removal findings (`no_prod_coverage`, `duplicate_coverage`, `subsumed_coverage`,
+`covered_by_suite`) carry `saved_ms`, the wall time above the fastest test (process overhead), and the report
+totals it per lint.
 
 `testslop crates` reports, per crate (nearest `Cargo.toml`): `.rs` test code, fixture lines (non-`.rs` files
 under `testdata/`, `fixtures/`, `snapshots/`, `tests/`, and `include_str!` targets of test code), `#[cfg(test)]`

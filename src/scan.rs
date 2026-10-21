@@ -25,6 +25,8 @@ pub struct TestFn {
     pub loc: usize,
     /// `#[should_panic]`: its expectation is a panic that coverage cannot see.
     pub should_panic: bool,
+    /// (line, 0-based column, macro or helper name) of each assertion in the body.
+    pub assert_sites: Vec<(usize, usize, String)>,
     /// Body with literals and non-keyword identifiers replaced by `$`.
     loose: String,
     /// Flattened exact body tokens, aligned position by position with `loose`.
@@ -68,6 +70,23 @@ impl TestFn {
     pub fn uses(&self, ident: &str) -> usize {
         self.exact.iter().filter(|t| *t == ident).count()
     }
+
+    /// Identifiers in the body.
+    pub fn idents(&self) -> impl Iterator<Item = &str> {
+        self.exact
+            .iter()
+            .map(String::as_str)
+            .filter(|t| t.starts_with(|c: char| c.is_alphabetic() || c == '_'))
+    }
+}
+
+/// What a test's attributes and signature say.
+struct TestAttrs {
+    should_panic: bool,
+    /// `#[ignore]` with no `= "reason"`.
+    unreasoned_ignore: bool,
+    /// Inputs outside the body, from proptest parameters or `#[case(..)]`-style attributes.
+    sig_inputs: BTreeSet<String>,
 }
 
 /// What a piece of test support code is.
@@ -95,6 +114,11 @@ impl Support {
     /// Occurrences of `ident` inside this item.
     pub fn uses(&self, ident: &str) -> usize {
         self.idents.get(ident).copied().unwrap_or(0)
+    }
+
+    /// Identifiers inside this item.
+    pub fn idents(&self) -> impl Iterator<Item = &str> {
+        self.idents.keys().map(String::as_str)
     }
 }
 
@@ -151,6 +175,7 @@ pub struct Scan {
 }
 
 /// Workspace-wide facts the per-file pass needs.
+#[derive(Default)]
 pub struct Index {
     /// Non-test functions in test code whose bodies assert: calls to them are assertions.
     asserting: HashSet<String>,
@@ -158,7 +183,110 @@ pub struct Index {
     golden: HashMap<String, String>,
     /// Occurrences of each identifier across every token of every file, definitions included.
     pub ident_counts: HashMap<String, usize>,
+    /// Names production code defines: types, traits, free functions, methods (minus `COMMON_NAMES`),
+    /// and identifiers inside item-level macros like `sol!`.
+    pub prod_names: HashSet<String>,
+    /// Traits each type `#[derive]`s.
+    derives: HashMap<String, HashSet<String>>,
+    /// Traits each type implements by hand (`impl Trait for Type`).
+    manual_impls: HashMap<String, HashSet<String>>,
+    /// Types whose serde derives are configured by `#[serde(..)]` attributes (on the type, a
+    /// variant or a field): their serialized form is a declared format, not trivial derive code.
+    serde_configured: HashSet<String>,
 }
+
+/// Function and method names too generic to show that a test calls workspace code.
+const COMMON_NAMES: &[&str] = &[
+    "new",
+    "from",
+    "into",
+    "default",
+    "clone",
+    "len",
+    "get",
+    "get_mut",
+    "iter",
+    "iter_mut",
+    "map",
+    "unwrap",
+    "expect",
+    "as_ref",
+    "as_mut",
+    "to_string",
+    "eq",
+    "ne",
+    "fmt",
+    "hash",
+    "cmp",
+    "partial_cmp",
+    "deref",
+    "deref_mut",
+    "drop",
+    "next",
+    "try_from",
+    "try_into",
+    "from_str",
+    "is_empty",
+    "push",
+    "pop",
+    "insert",
+    "remove",
+    "contains",
+    "with_capacity",
+    "build",
+    "parse",
+    "read",
+    "write",
+    "call",
+    "run",
+    "set",
+    "update",
+    "init",
+    "open",
+    "close",
+    "start",
+    "stop",
+    "send",
+    "recv",
+    "encode",
+    "decode",
+    "serialize",
+    "deserialize",
+    "as_str",
+    "as_bytes",
+    "to_vec",
+    "to_owned",
+    "borrow",
+    "index",
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "main",
+    "flush",
+    "poll",
+    "extend",
+    "clear",
+    "first",
+    "last",
+    "keys",
+    "values",
+    "entry",
+    "and_then",
+    "ok",
+    "err",
+    "is_some",
+    "is_none",
+    "is_ok",
+    "is_err",
+    "len_hint",
+    "size_hint",
+    "into_iter",
+    "collect",
+    "filter",
+    "fold",
+    "sum",
+];
 
 /// A test whose tail expression is `callee(args.., |..| { body })`.
 struct Envelope {
@@ -209,6 +337,13 @@ fn is_test_file(rel: &Path, ast: &syn::File) -> bool {
     }) || is_cfg_test(&ast.attrs)
 }
 
+/// `#[serde(..)]`, or `#[cfg_attr(feature = "serde", serde(..))]`.
+fn is_serde_attr(a: &syn::Attribute) -> bool {
+    a.path().is_ident("serde")
+        || (a.path().is_ident("cfg_attr")
+            && a.meta.to_token_stream().to_string().contains("serde ("))
+}
+
 /// Builds the `Index` in a first pass over every file.
 fn index(root: &Path) -> Index {
     struct Pass {
@@ -216,8 +351,22 @@ fn index(root: &Path) -> Index {
         idx: Index,
     }
     impl Pass {
-        fn check(&mut self, attrs: &[syn::Attribute], ident: &syn::Ident, body: &syn::Block) {
-            if !self.in_test || attrs.iter().any(is_test_attr) {
+        /// `method`: an impl or trait fn, whose generic names (`COMMON_NAMES`) do not count.
+        fn check(
+            &mut self,
+            attrs: &[syn::Attribute],
+            ident: &syn::Ident,
+            body: &syn::Block,
+            method: bool,
+        ) {
+            if !self.in_test {
+                let name = ident.to_string();
+                if !method || !COMMON_NAMES.contains(&name.as_str()) {
+                    self.idx.prod_names.insert(name);
+                }
+                return;
+            }
+            if attrs.iter().any(is_test_attr) {
                 return;
             }
             if asserts_anything(body) {
@@ -225,6 +374,37 @@ fn index(root: &Path) -> Index {
             }
             if let Some(m) = golden_marker(body, &HashMap::new()) {
                 self.idx.golden.insert(ident.to_string(), m);
+            }
+        }
+        fn ty(&mut self, attrs: &[syn::Attribute], ident: &syn::Ident) {
+            let name = ident.to_string();
+            let derived: HashSet<String> = attrs
+                .iter()
+                .filter(|a| a.path().is_ident("derive"))
+                .filter_map(|a| {
+                    a.parse_args_with(Punctuated::<syn::Path, syn::Token![,]>::parse_terminated)
+                        .ok()
+                })
+                .flatten()
+                .filter_map(|p| p.segments.last().map(|s| s.ident.to_string()))
+                .collect();
+            self.idx
+                .derives
+                .entry(name.clone())
+                .or_default()
+                .extend(derived);
+            if !self.in_test {
+                self.idx.prod_names.insert(name);
+            }
+        }
+        /// Records `name` as serde-configured when any of `attr_sets` has `#[serde(..)]`.
+        fn serde_attrs<'f>(
+            &mut self,
+            name: &syn::Ident,
+            mut attr_sets: impl Iterator<Item = &'f [syn::Attribute]>,
+        ) {
+            if attr_sets.any(|attrs| attrs.iter().any(is_serde_attr)) {
+                self.idx.serde_configured.insert(name.to_string());
             }
         }
     }
@@ -238,13 +418,86 @@ fn index(root: &Path) -> Index {
         fn visit_item_fn(&mut self, f: &'a syn::ItemFn) {
             let was = self.in_test;
             self.in_test |= is_cfg_test(&f.attrs);
-            self.check(&f.attrs, &f.sig.ident, &f.block);
+            self.check(&f.attrs, &f.sig.ident, &f.block, false);
             syn::visit::visit_item_fn(self, f);
             self.in_test = was;
         }
         fn visit_impl_item_fn(&mut self, f: &'a syn::ImplItemFn) {
-            self.check(&f.attrs, &f.sig.ident, &f.block);
+            self.check(&f.attrs, &f.sig.ident, &f.block, true);
             syn::visit::visit_impl_item_fn(self, f);
+        }
+        fn visit_trait_item_fn(&mut self, f: &'a syn::TraitItemFn) {
+            if !self.in_test {
+                let name = f.sig.ident.to_string();
+                if !COMMON_NAMES.contains(&name.as_str()) {
+                    self.idx.prod_names.insert(name);
+                }
+            }
+            syn::visit::visit_trait_item_fn(self, f);
+        }
+        fn visit_item_struct(&mut self, i: &'a syn::ItemStruct) {
+            self.ty(&i.attrs, &i.ident);
+            let fields = i.fields.iter().map(|f| f.attrs.as_slice());
+            self.serde_attrs(&i.ident, std::iter::once(i.attrs.as_slice()).chain(fields));
+            syn::visit::visit_item_struct(self, i);
+        }
+        fn visit_item_enum(&mut self, i: &'a syn::ItemEnum) {
+            self.ty(&i.attrs, &i.ident);
+            let variants = i.variants.iter().flat_map(|v| {
+                std::iter::once(v.attrs.as_slice())
+                    .chain(v.fields.iter().map(|f| f.attrs.as_slice()))
+            });
+            self.serde_attrs(
+                &i.ident,
+                std::iter::once(i.attrs.as_slice()).chain(variants),
+            );
+            syn::visit::visit_item_enum(self, i);
+        }
+        fn visit_item_trait(&mut self, i: &'a syn::ItemTrait) {
+            if !self.in_test {
+                self.idx.prod_names.insert(i.ident.to_string());
+            }
+            syn::visit::visit_item_trait(self, i);
+        }
+        fn visit_item_type(&mut self, i: &'a syn::ItemType) {
+            if !self.in_test {
+                self.idx.prod_names.insert(i.ident.to_string());
+            }
+        }
+        fn visit_item_impl(&mut self, i: &'a syn::ItemImpl) {
+            if let (Some((_, tr, _)), syn::Type::Path(ty)) = (&i.trait_, &*i.self_ty)
+                && let (Some(t), Some(s)) = (tr.segments.last(), ty.path.segments.last())
+            {
+                self.idx
+                    .manual_impls
+                    .entry(s.ident.to_string())
+                    .or_default()
+                    .insert(t.ident.to_string());
+            }
+            syn::visit::visit_item_impl(self, i);
+        }
+        fn visit_item_macro(&mut self, m: &'a syn::ItemMacro) {
+            // `sol! { interface IFoo { function bar(); } }` defines `IFoo` and `bar`.
+            if !self.in_test {
+                let mut stack = vec![m.mac.tokens.clone()];
+                while let Some(ts) = stack.pop() {
+                    for tt in ts {
+                        match tt {
+                            TokenTree::Ident(i) => {
+                                let n = i.to_string();
+                                if !COMMON_NAMES.contains(&n.as_str())
+                                    && !KEYWORDS.contains(&n.as_str())
+                                {
+                                    self.idx.prod_names.insert(n);
+                                }
+                            }
+                            TokenTree::Group(g) => stack.push(g.stream()),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            syn::visit::visit_item_macro(self, m);
         }
     }
     fn count_idents(ts: TokenStream, counts: &mut HashMap<String, usize>) {
@@ -258,11 +511,7 @@ fn index(root: &Path) -> Index {
     }
     let mut p = Pass {
         in_test: false,
-        idx: Index {
-            asserting: HashSet::new(),
-            golden: HashMap::new(),
-            ident_counts: HashMap::new(),
-        },
+        idx: Index::default(),
     };
     for (rel, _, ast) in rust_files(root) {
         p.in_test = is_test_file(&rel, &ast);
@@ -494,11 +743,7 @@ pub fn scan(root: &Path) -> Scan {
         crates: BTreeMap::new(),
         test_code: HashMap::new(),
         file_test_loc: HashMap::new(),
-        index: Index {
-            asserting: HashSet::new(),
-            golden: HashMap::new(),
-            ident_counts: HashMap::new(),
-        },
+        index: Index::default(),
     };
     let mut envelopes: BTreeMap<(String, String), Vec<EnvelopeUse>> = BTreeMap::new();
     let mut includes: Vec<(String, PathBuf)> = vec![];
@@ -1011,6 +1256,234 @@ fn param_inputs(tt: TokenTree, inputs: &mut BTreeSet<String>) {
     }
 }
 
+/// The condition of an environment-dependent early exit among `stmts`: `if <check> { ..; return; }`
+/// or `let .. = <check> else { return };`, where the check reads an env var, a tool's availability,
+/// a path's existence, `cfg!`, or a CI flag.
+fn silent_skip(stmts: &[syn::Stmt]) -> Option<String> {
+    fn block_returns(b: &syn::Block) -> bool {
+        b.stmts
+            .iter()
+            .any(|s| matches!(s, syn::Stmt::Expr(syn::Expr::Return(_), _)))
+    }
+    const MARKERS: &[&str] = &[
+        "env ::",
+        "var (",
+        "var_os",
+        "available",
+        "installed",
+        "enabled",
+        "which",
+        "exists ()",
+        "is_ci",
+        "\"CI\"",
+        "skip",
+        "cfg !",
+        "Command",
+    ];
+    stmts.iter().find_map(|st| {
+        let (cond, exits) = match st {
+            syn::Stmt::Expr(syn::Expr::If(i), _) => {
+                (i.cond.to_token_stream(), block_returns(&i.then_branch))
+            }
+            syn::Stmt::Local(syn::Local {
+                init: Some(init), ..
+            }) => match &init.diverge {
+                Some((_, div)) => (
+                    init.expr.to_token_stream(),
+                    match &**div {
+                        syn::Expr::Return(_) => true,
+                        syn::Expr::Block(b) => block_returns(&b.block),
+                        _ => false,
+                    },
+                ),
+                None => return None,
+            },
+            _ => return None,
+        };
+        let c = cond.to_string();
+        // `if !is_ci() { return }` skips locally but runs in CI; skipping *in* CI is the silent one.
+        let ci_only = c.contains("is_ci") && c.trim_start().starts_with('!');
+        (exits && !ci_only && MARKERS.iter().any(|m| c.contains(m))).then_some(c)
+    })
+}
+
+/// Why a test exercises nothing but trivial code: every assertion reads back a field or getter of a
+/// value it built from the same literal, or it only uses impls its types `#[derive]` (none written by hand).
+fn trivial_reason(stmts: &[syn::Stmt], n_asserts: usize, index: &Index) -> Option<String> {
+    if n_asserts == 0 {
+        return None;
+    }
+    // (a) Read-backs: `let v = T { f: 1 }` or `T::new(1)`, then `assert_eq!(v.f, 1)` / `v.f()`.
+    let mut built: HashMap<String, HashSet<String>> = HashMap::new();
+    for st in stmts {
+        if let syn::Stmt::Local(syn::Local {
+            pat: syn::Pat::Ident(p),
+            init: Some(init),
+            ..
+        }) = st
+        {
+            let lits: Option<HashSet<String>> = match &*init.expr {
+                syn::Expr::Struct(e) => e
+                    .fields
+                    .iter()
+                    .map(|f| match &f.expr {
+                        syn::Expr::Lit(l) => Some(compact(l)),
+                        _ => None,
+                    })
+                    .collect(),
+                syn::Expr::Call(c) if matches!(&*c.func, syn::Expr::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "new" || s.ident == "from")) => {
+                    c.args
+                        .iter()
+                        .map(|a| match a {
+                            syn::Expr::Lit(l) => Some(compact(l)),
+                            _ => None,
+                        })
+                        .collect()
+                }
+                _ => None,
+            };
+            if let Some(l) = lits.filter(|l| !l.is_empty()) {
+                built.insert(p.ident.to_string(), l);
+            }
+        }
+    }
+    let reads_back = |a: &syn::Expr, b: &syn::Expr| {
+        let base = match a {
+            syn::Expr::Field(f) => &f.base,
+            syn::Expr::MethodCall(m) if m.args.is_empty() => &m.receiver,
+            _ => return false,
+        };
+        matches!((&**base, b), (syn::Expr::Path(p), syn::Expr::Lit(l))
+            if built.get(&compact(p)).is_some_and(|lits| lits.contains(&compact(l))))
+    };
+    let readbacks = stmts
+        .iter()
+        .filter_map(stmt_macro)
+        .filter(|m| macro_name(m) == "assert_eq")
+        .filter_map(macro_args)
+        .filter(|a| {
+            let v: Vec<&syn::Expr> = a.iter().collect();
+            v.len() >= 2 && (reads_back(v[0], v[1]) || reads_back(v[1], v[0]))
+        })
+        .count();
+    if readbacks == n_asserts && !built.is_empty() {
+        return Some("only reads back fields it set from the same literals".into());
+    }
+
+    // (b) Derived impls only: build workspace types, then only clone, `Default`, serde round trips,
+    // `{:?}` and `assert_eq!`.
+    struct Uses {
+        types: BTreeSet<String>,
+        traits: BTreeSet<&'static str>,
+        other_call: bool,
+    }
+    impl<'a> Visit<'a> for Uses {
+        fn visit_expr_struct(&mut self, e: &'a syn::ExprStruct) {
+            if let Some(s) = e.path.segments.last() {
+                self.types.insert(s.ident.to_string());
+            }
+            syn::visit::visit_expr_struct(self, e);
+        }
+        fn visit_expr_call(&mut self, c: &'a syn::ExprCall) {
+            match &*c.func {
+                syn::Expr::Path(p) => {
+                    let segs: Vec<String> = p
+                        .path
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.to_string())
+                        .collect();
+                    let last = segs.last().map(String::as_str).unwrap_or_default();
+                    let serde_crate = segs.iter().any(|s| {
+                        matches!(
+                            s.as_str(),
+                            "serde_json" | "bincode" | "toml" | "postcard" | "serde_yaml"
+                        )
+                    });
+                    if last == "default" {
+                        self.traits.insert("Default");
+                        if let [.., ty, _] = segs.as_slice() {
+                            self.types.insert(ty.clone());
+                        }
+                    } else if serde_crate {
+                        self.traits.extend(["Serialize", "Deserialize"]);
+                    } else if let [ty] = segs.as_slice()
+                        && ty.starts_with(|c: char| c.is_uppercase())
+                    {
+                        // Tuple-struct construction `T(..)`.
+                        self.types.insert(ty.clone());
+                    } else {
+                        self.other_call = true;
+                    }
+                }
+                _ => self.other_call = true,
+            }
+            syn::visit::visit_expr_call(self, c);
+        }
+        fn visit_expr_method_call(&mut self, c: &'a syn::ExprMethodCall) {
+            match c.method.to_string().as_str() {
+                "clone" => {
+                    self.traits.insert("Clone");
+                }
+                "unwrap" | "expect" => {}
+                _ => self.other_call = true,
+            }
+            syn::visit::visit_expr_method_call(self, c);
+        }
+        fn visit_macro(&mut self, m: &'a syn::Macro) {
+            let n = macro_name(m);
+            if matches!(n.as_str(), "assert_eq" | "assert_ne") {
+                self.traits.extend(["PartialEq", "Debug"]);
+            }
+            if m.tokens.to_string().contains(":?") {
+                self.traits.insert("Debug");
+            }
+            if let Some(args) = macro_args(m) {
+                args.iter().for_each(|e| self.visit_expr(e));
+            }
+        }
+    }
+    let mut u = Uses {
+        types: BTreeSet::new(),
+        traits: BTreeSet::new(),
+        other_call: false,
+    };
+    for st in stmts {
+        u.visit_stmt(st);
+    }
+    if u.other_call || u.traits.is_empty() {
+        return None;
+    }
+    let serde = u.traits.contains("Serialize") || u.traits.contains("Deserialize");
+    let derived_only = |ty: &String| {
+        !(serde && index.serde_configured.contains(ty))
+            && index
+                .derives
+                .get(ty)
+                .is_some_and(|d| u.traits.iter().all(|t| d.contains(*t)))
+            && index
+                .manual_impls
+                .get(ty)
+                .is_none_or(|m| u.traits.iter().all(|t| !m.contains(*t)))
+    };
+    let types: Vec<&String> = u
+        .types
+        .iter()
+        .filter(|t| index.derives.contains_key(*t))
+        .collect();
+    (!types.is_empty() && types.iter().all(|t| derived_only(t))).then(|| {
+        format!(
+            "only exercises derived {} of {}",
+            u.traits.iter().copied().collect::<Vec<_>>().join(", "),
+            types
+                .iter()
+                .map(|t| format!("`{t}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 /// Walks one test body for assertions, inputs, panic paths and assertion-level smells.
 struct BodyScan<'a> {
     file: &'a Path,
@@ -1019,6 +1492,7 @@ struct BodyScan<'a> {
     inputs: BTreeSet<String>,
     panic_path: bool,
     repeated: Option<(usize, usize)>,
+    sites: Vec<(usize, usize, String)>,
     helpers: &'a HashSet<String>,
     hits: &'a mut Vec<Hit>,
 }
@@ -1043,6 +1517,7 @@ impl BodyScan<'_> {
 
     fn hit(&mut self, lint: Lint, line: usize, saved_loc: usize, detail: String) {
         self.hits.push(Hit {
+            saved_ms: None,
             lint,
             file: self.file.into(),
             line,
@@ -1119,6 +1594,8 @@ impl<'ast> Visit<'ast> for BodyScan<'_> {
         if is_assert_macro(&n) {
             let text = checked.iter().map(compact).collect::<Vec<_>>().join(",");
             self.asserts.insert(format!("{n}!({text})"));
+            let at = m.span().start();
+            self.sites.push((at.line, at.column, format!("{n}!")));
             if let ("assert_eq" | "assert_ne", [a, b, ..]) = (n.as_str(), checked.as_slice()) {
                 let (a, b) = (
                     a.to_token_stream().to_string(),
@@ -1171,6 +1648,8 @@ impl<'ast> Visit<'ast> for BodyScan<'_> {
                 .is_some_and(|s| self.is_assert_call(&s.ident.to_string()))
         {
             self.asserts.insert(compact(c));
+            let at = c.span().start();
+            self.sites.push((at.line, at.column, compact(&c.func)));
         }
         syn::visit::visit_expr_call(self, c);
     }
@@ -1182,6 +1661,8 @@ impl<'ast> Visit<'ast> for BodyScan<'_> {
         );
         if self.is_assert_call(&m) {
             self.asserts.insert(compact(c));
+            let at = c.method.span().start();
+            self.sites.push((at.line, at.column, format!(".{m}")));
         }
         syn::visit::visit_expr_method_call(self, c);
     }
@@ -1361,6 +1842,7 @@ fn divider_hits(file: &Path, src: &[&str], code: &TestCode, hits: &mut Vec<Hit>)
         .collect();
     if let Some(&first) = at.first() {
         hits.push(Hit {
+            saved_ms: None,
             lint: Lint::DividerComment,
             file: file.into(),
             line: first,
@@ -1395,6 +1877,7 @@ struct FileScan<'a> {
 impl FileScan<'_> {
     fn hit(&mut self, lint: Lint, line: usize, item: &str, saved_loc: usize, detail: String) {
         self.hits.push(Hit {
+            saved_ms: None,
             lint,
             file: self.file.into(),
             line,
@@ -1441,6 +1924,10 @@ impl<'ast> Visit<'ast> for FileScan<'_> {
             return;
         }
         let should_panic = f.attrs.iter().any(|a| attr_path(a) == "should_panic");
+        let unreasoned_ignore = f
+            .attrs
+            .iter()
+            .any(|a| attr_path(a) == "ignore" && matches!(a.meta, syn::Meta::Path(_)));
         let mut sig_inputs = BTreeSet::new();
         for a in f
             .attrs
@@ -1456,8 +1943,11 @@ impl<'ast> Visit<'ast> for FileScan<'_> {
             f.sig.ident.to_string(),
             f.span().start().line..=f.span().end().line,
             &f.block,
-            should_panic,
-            sig_inputs,
+            TestAttrs {
+                should_panic,
+                unreasoned_ignore,
+                sig_inputs,
+            },
         );
     }
     fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
@@ -1647,8 +2137,11 @@ impl FileScan<'_> {
                                 name,
                                 p.span().start().line..=end,
                                 &block,
-                                false,
-                                sig_inputs,
+                                TestAttrs {
+                                    should_panic: false,
+                                    unreasoned_ignore: false,
+                                    sig_inputs,
+                                },
                             );
                         }
                         i = k + 1;
@@ -1669,9 +2162,13 @@ impl FileScan<'_> {
         name: String,
         span: RangeInclusive<usize>,
         block: &syn::Block,
-        should_panic: bool,
-        sig_inputs: BTreeSet<String>,
+        attrs: TestAttrs,
     ) {
+        let TestAttrs {
+            should_panic,
+            unreasoned_ignore,
+            sig_inputs,
+        } = attrs;
         let (line, loc) = (*span.start(), span.end() - span.start() + 1);
         if !self.in_test {
             self.test_ranges.push(span.clone());
@@ -1684,6 +2181,7 @@ impl FileScan<'_> {
             inputs: sig_inputs,
             panic_path: false,
             repeated: None,
+            sites: vec![],
             helpers: &self.index.asserting,
             hits: self.hits,
         };
@@ -1693,8 +2191,41 @@ impl FileScan<'_> {
             inputs,
             panic_path,
             repeated,
+            sites,
             ..
         } = body;
+        let effective = match envelope(block) {
+            Some((env, inner)) => {
+                self.envelopes.push(EnvelopeUse {
+                    callee: env.callee,
+                    file: self.file.into(),
+                    line,
+                    lines: env.lines,
+                });
+                inner
+            }
+            None => &block.stmts[..],
+        };
+        if let Some(cond) = silent_skip(effective) {
+            self.hit(
+                Lint::SilentSkip,
+                line,
+                &name,
+                0,
+                format!("returns early when `{cond}`: passes without testing"),
+            );
+        } else if unreasoned_ignore {
+            self.hit(
+                Lint::SilentSkip,
+                line,
+                &name,
+                0,
+                "`#[ignore]` without a reason: nobody knows when to run it".into(),
+            );
+        }
+        if let Some(why) = trivial_reason(effective, asserts.len(), self.index) {
+            self.hit(Lint::TestsTrivialCode, line, &name, loc, why);
+        }
         if asserts.is_empty() && !panic_path && !should_panic {
             self.hit(Lint::NoAssertionTest, line, &name, 0, String::new());
         }
@@ -1744,18 +2275,6 @@ impl FileScan<'_> {
             );
         }
 
-        let effective = match envelope(block) {
-            Some((env, inner)) => {
-                self.envelopes.push(EnvelopeUse {
-                    callee: env.callee,
-                    file: self.file.into(),
-                    line,
-                    lines: env.lines,
-                });
-                inner
-            }
-            None => &block.stmts[..],
-        };
         let stmts = effective
             .iter()
             .map(|s| (literal_blind(s.to_token_stream()), code_lines(s)))
@@ -1777,6 +2296,7 @@ impl FileScan<'_> {
             line,
             loc,
             should_panic,
+            assert_sites: sites,
             loose,
             exact,
             stmts,
@@ -1796,6 +2316,7 @@ fn envelope_hits(envelopes: BTreeMap<(String, String), Vec<EnvelopeUse>>, hits: 
         let EnvelopeUse { file, line, .. } = &users[0];
         let krate = if krate.is_empty() { "." } else { &krate };
         hits.push(Hit {
+            saved_ms: None,
             lint: Lint::TestEnvelope,
             file: file.clone(),
             line: *line,
@@ -1855,6 +2376,7 @@ fn clone_hits(tests: &[TestFn], hits: &mut Vec<Hit>) {
             cluster.sort_by_key(|t| t.line);
             let n_holes = holes.iter().filter(|x| **x).count();
             hits.push(Hit {
+                saved_ms: None,
                 lint: Lint::ParametrizableTests,
                 file: seed.file.clone(),
                 line: cluster[0].line,
@@ -1906,6 +2428,7 @@ fn fixture_hits(tests: &[TestFn], hits: &mut Vec<Hit>) {
                 .min_by_key(|t| t.line)
                 .expect("filtered to >= 3 users");
             hits.push(Hit {
+                saved_ms: None,
                 lint: Lint::MissingFixture,
                 file: file.into(),
                 line: first.line,
@@ -1929,7 +2452,7 @@ mod tests {
         let index = Index {
             asserting: ["execute_case".to_owned()].into(),
             golden: [("check_golden".to_owned(), "env `UPDATE_GOLDEN`".to_owned())].into(),
-            ident_counts: HashMap::new(),
+            ..Index::default()
         };
         let mut fs = FileScan {
             file: Path::new("src/lib.rs"),
@@ -2113,11 +2636,7 @@ mod tests {
         "#;
         let ast = syn::parse_file(src).expect("parses");
         let lines: Vec<&str> = src.lines().collect();
-        let index = Index {
-            asserting: HashSet::new(),
-            golden: HashMap::new(),
-            ident_counts: HashMap::new(),
-        };
+        let index = Index::default();
         let mut hits = vec![];
         let mut fs = FileScan {
             file: Path::new("crates/x/src/a.rs"),
@@ -2182,6 +2701,140 @@ mod tests {
         assert!(intentionally_unused(&f.attrs, &f.sig.ident));
         let f: syn::ItemFn = syn::parse_quote! { #[allow(clippy::foo)] fn helper() {} };
         assert!(!intentionally_unused(&f.attrs, &f.sig.ident));
+    }
+
+    #[test]
+    fn silent_skip_needs_an_environment_check_and_a_return() {
+        let stmts = |b: syn::Block| b.stmts;
+        assert!(
+            silent_skip(&stmts(syn::parse_quote!({
+                if !z3_available() {
+                    return;
+                }
+                run();
+            })))
+            .is_some()
+        );
+        assert!(
+            silent_skip(&stmts(syn::parse_quote!({
+                let Ok(p) = std::env::var("BIN") else {
+                    return Ok(());
+                };
+            })))
+            .is_some()
+        );
+        assert!(
+            silent_skip(&stmts(syn::parse_quote!({
+                if n == 0 {
+                    return;
+                }
+                run();
+            })))
+            .is_none()
+        );
+        assert!(
+            silent_skip(&stmts(syn::parse_quote!({
+                if std::env::var("X").is_ok() {
+                    run();
+                }
+            })))
+            .is_none()
+        );
+        let ci_only = stmts(syn::parse_quote!({
+            if !ci_info::is_ci() {
+                return;
+            }
+            run();
+        }));
+        assert!(silent_skip(&ci_only).is_none());
+        let skipped_in_ci = stmts(syn::parse_quote!({
+            if ci_info::is_ci() {
+                return;
+            }
+            run();
+        }));
+        assert!(silent_skip(&skipped_in_ci).is_some());
+    }
+
+    #[test]
+    fn trivial_tests_read_back_literals_or_use_only_derived_impls() {
+        let mut index = Index::default();
+        index.derives.insert(
+            "Config".into(),
+            ["Clone", "Debug", "PartialEq"].map(String::from).into(),
+        );
+        index.derives.insert(
+            "Celsius".into(),
+            ["Clone", "Debug"].map(String::from).into(),
+        );
+        index
+            .manual_impls
+            .insert("Celsius".into(), ["PartialEq".to_owned()].into());
+        let stmts = |b: syn::Block| b.stmts;
+        let readback = stmts(syn::parse_quote!({
+            let p = P { x: 1, y: 2 };
+            assert_eq!(p.x, 1);
+        }));
+        assert_eq!(
+            trivial_reason(&readback, 1, &index).as_deref(),
+            Some("only reads back fields it set from the same literals")
+        );
+        let computed = stmts(syn::parse_quote!({
+            let p = P { x: 1 };
+            assert_eq!(p.x, 1);
+            assert_eq!(p.area(), 0);
+        }));
+        assert_eq!(trivial_reason(&computed, 2, &index), None);
+        let derived = stmts(syn::parse_quote!({
+            let c = Config { n: 1 };
+            assert_eq!(c.clone(), c);
+        }));
+        assert_eq!(
+            trivial_reason(&derived, 1, &index).as_deref(),
+            Some("only exercises derived Clone, Debug, PartialEq of `Config`")
+        );
+        let manual = stmts(syn::parse_quote!({
+            assert_eq!(Celsius(1), Celsius(1).clone());
+        }));
+        assert_eq!(trivial_reason(&manual, 1, &index), None);
+        let calls_code = stmts(syn::parse_quote!({
+            let c = Config { n: 1 };
+            assert_eq!(c.scaled(), c);
+        }));
+        assert_eq!(trivial_reason(&calls_code, 1, &index), None);
+        index.derives.insert(
+            "Wire".into(),
+            ["Debug", "PartialEq", "Serialize", "Deserialize"]
+                .map(String::from)
+                .into(),
+        );
+        index.serde_configured.insert("Wire".into());
+        let wire = stmts(syn::parse_quote!({
+            let w = Wire { a: 1 };
+            assert_eq!(
+                serde_json::from_str::<Wire>(&serde_json::to_string(&w).unwrap()).unwrap(),
+                w
+            );
+        }));
+        assert_eq!(
+            trivial_reason(&wire, 1, &index),
+            None,
+            "#[serde(..)] declares a format"
+        );
+    }
+
+    #[test]
+    fn serde_attributes_count_behind_cfg_attr() {
+        let s: syn::ItemStruct = syn::parse_quote! {
+            #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+            #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+            #[serde(default)]
+            struct S;
+        };
+        assert_eq!(
+            s.attrs.iter().map(is_serde_attr).collect::<Vec<_>>(),
+            [true, false, true]
+        );
     }
 
     #[test]

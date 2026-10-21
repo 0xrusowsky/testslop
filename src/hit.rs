@@ -56,6 +56,16 @@ pub enum Lint {
     OrphanedTestHelper,
     /// A unit test whose production regions another suite (`cov --against`) already runs.
     CoveredBySuite,
+    /// An assertion that never executed while its test passed (inside an untaken branch, an empty
+    /// loop, or a closure nobody called).
+    UnexecutedAssertion,
+    /// A test that returns early on an environment check, or is `#[ignore]`d without a reason:
+    /// it passes without testing.
+    SilentSkip,
+    /// A test that only reads back what it constructed, or only exercises derived impls.
+    TestsTrivialCode,
+    /// A test that calls no code defined in the workspace.
+    TestsUpstreamOnly,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,6 +78,9 @@ pub struct Hit {
     pub item: String,
     /// Rough lines of code the suggested change removes.
     pub saved_loc: usize,
+    /// Test run time the suggested change removes, from `cov` (wall time above the fastest test).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_ms: Option<u64>,
     pub detail: String,
 }
 
@@ -80,15 +93,23 @@ pub fn print_report(hits: &[Hit], limit: usize) {
     for (lint, mut hs) in by_lint {
         hs.sort_by_key(|h| std::cmp::Reverse(h.saved_loc));
         let saved: usize = hs.iter().map(|h| h.saved_loc).sum();
+        let ms: Option<u64> = hs
+            .iter()
+            .filter_map(|h| h.saved_ms)
+            .reduce(u64::saturating_add);
         let name = serde_json::to_value(lint).expect("unit enum serializes");
+        let time = ms
+            .map(|ms| format!(", ~{:.1}s", ms as f64 / 1000.0))
+            .unwrap_or_default();
         println!(
-            "\n== {} : {} hits, ~{saved} LOC",
+            "\n== {} : {} hits, ~{saved} LOC{time}",
             name.as_str().unwrap_or_default(),
             hs.len()
         );
         for h in hs.iter().take(limit) {
+            let ms = h.saved_ms.map(|ms| format!(" {ms}ms")).unwrap_or_default();
             println!(
-                "  -{:<4} {}:{} {}  {}",
+                "  -{:<4}{ms} {}:{} {}  {}",
                 h.saved_loc,
                 h.file.display(),
                 h.line,
